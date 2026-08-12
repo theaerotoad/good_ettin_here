@@ -1,71 +1,103 @@
-# Ettin 150M ONNX Reranker API (Ultra-Lightweight Flask Edition)
+# Ettin 150M ONNX Reranker & EmbeddingGemma API Server (Ultra-Lightweight Flask Edition)
 
-An ultra-fast, production-ready Python API server for **`cross-encoder/ettin-reranker-150m-v1`** using **ONNX Runtime and Flask ONLY**.
+An ultra-lightweight, high-performance Flask API server for running local ONNX models for document reranking and text embeddings without heavy PyTorch dependencies. 
 
-Only 5 dependencies! Zero PyTorch, Zero Transformers, Zero FastAPI/Uvicorn, Zero HuggingFace Hub.  Goal is to have a drop in python library for llama-swap that runs a llamacpp / OpenAI compatible re-ranker for use in things like qmdpy.
+Limited dependancies.  Goal is to have a drop in python library for llama-swap that runs a llamacpp / OpenAI compatible re-ranker for use in things like qmdpy.
 
 ---
 
-## Local Directory Structure Expected
+## Model Setup & Downloading Models
 
-Place your local model files in a single directory (e.g., `./model`):
+### 1. Downloading EmbeddingGemma ONNX
 
-```text
-model/
-├── tokenizer.json
-├── onnx/
-│   └── model.onnx
-├── 2_Dense/
-│   └── model.safetensors
-├── 3_LayerNorm/
-│   └── model.safetensors
-└── 4_Dense/
-    └── model.safetensors
+You can download the pre-quantized ONNX version of EmbeddingGemma directly using Hugging Face CLI:
+
+```bash
+# Using huggingface-cli
+huggingface-cli download onnx-community/embeddinggemma-300m-ONNX --local-dir ./embeddinggemma_model
+
+# Or using hf download
+hf download onnx-community/embeddinggemma-300m-ONNX --local-dir ./embeddinggemma_model
 
 ```
 
-> **Tip:** You can download the model folder once using `git lfs clone https://huggingface.co/cross-encoder/ettin-reranker-150m-v1 ./model` or `huggingface-cli download cross-encoder/ettin-reranker-150m-v1 --local-dir ./model`.
+### 2. Local Directory Structure Expected
+
+Your local directory structure for models can look like this:
+
+```text
+.
+├── model/                     # Ettin Reranker files
+│   ├── model.onnx (or onnx/model.onnx)
+│   ├── tokenizer.json
+│   ├── 2_Dense.safetensors
+│   ├── 3_LayerNorm.safetensors
+│   └── 4_Dense.safetensors
+└── embeddinggemma_model/     # EmbeddingGemma ONNX files
+    ├── model.onnx (or model_quantized.onnx)
+    └── tokenizer.json
+
+```
+
+---
+
+## Installation
+
+Install required dependencies locally:
+
+```bash
+pip install -r requirements.txt
+
+```
 
 ---
 
 ## CLI Options
 
-```bash
-python -m app.server --help
+The server accepts command-line arguments (overriding environment variables):
 
-```
-
-| Argument | Default | Description |
-| --- | --- | --- |
-| `--model-dir` | `./model` | Path to local directory containing model weights |
-| `--onnx-path` | `None` | Optional direct path to `model.onnx` |
-| `--host` | `0.0.0.0` | Host address to bind server |
-| `--port` | `8000` | Port to bind server |
-| `--max-length` | `8192` | Maximum context length |
-| `--batch-size` | `32` | Batch size for ONNX inference |
-| `--use-gpu` | `False` | Enable CUDA Execution Provider if available |
-| `--normalize-scores` | `True` | Apply sigmoid score normalization `sigmoid(score / 5.0)` |
-| `--no-normalize-scores` | `False` | Disable normalization and output raw logits |
+| Option | Environment Variable | Default | Description |
+| --- | --- | --- | --- |
+| `--model-type` | `MODEL_TYPE` | `ettin` | Model hosting mode: `ettin`, `embeddinggemma`, `gemma`, `both`, or `auto` |
+| `--model-dir` | `MODEL_DIR` | `./model` | Path to directory containing Ettin model files & tokenizer |
+| `--onnx-path` | `ONNX_PATH` | `None` | Direct path to Ettin `model.onnx` file |
+| `--embedding-model-dir` | `EMBEDDING_MODEL_DIR` | `None` | Directory containing EmbeddingGemma ONNX model & tokenizer (defaults to `--model-dir` if unassigned) |
+| `--embedding-onnx-path` | `EMBEDDING_ONNX_PATH` | `None` | Direct path to EmbeddingGemma `model.onnx` file |
+| `--model-name` | `MODEL_NAME` | `cross-encoder/ettin-reranker-150m-v1` | Model name identifier in OpenAI API responses for reranker |
+| `--embedding-model-name` | `EMBEDDING_MODEL_NAME` | `google/embeddinggemma-300m` | Model name identifier in OpenAI API responses for EmbeddingGemma |
+| `--host` | `HOST` | `0.0.0.0` | IP address to bind server |
+| `--port` | `PORT` | `8000` | Port to bind server |
+| `--max-length` | `MAX_LENGTH` | `8192` | Maximum token sequence length |
+| `--batch-size` | `BATCH_SIZE` | `32` | Batch size for inference |
+| `--use-gpu` | `USE_GPU` | `false` | Enable CUDA GPU execution provider if available |
+| `--normalize-scores` | `NORMALIZE_SCORES` | `false` | Apply sigmoid score normalization for reranking scores |
 
 ---
 
 ## Running the Server
 
-### 1. Direct Python Execution
+### 1. Run with Ettin Reranker only:
 
 ```bash
-pip install -r requirements.txt
-
-# Run with custom model path and port
-python -m app.server --model-dir /path/to/my_model --host 0.0.0.0 --port 8000
+python -m app.server --model-type ettin --model-dir ./model --port 8000
 
 ```
 
-### 2. Docker Execution
+### 2. Run with EmbeddingGemma only:
 
 ```bash
-docker build -t ettin-reranker-flask .
-docker run -p 8000:8000 -v /path/to/my_model:/app/model ettin-reranker-flask
+python -m app.server --model-type embeddinggemma --model-dir ./embeddinggemma_model --port 8000
+
+```
+
+### 3. Run both Reranker and EmbeddingGemma simultaneously:
+
+```bash
+python -m app.server \
+  --model-type both \
+  --model-dir ./model \
+  --embedding-model-dir ./embeddinggemma_model \
+  --port 8000
 
 ```
 
@@ -73,36 +105,96 @@ docker run -p 8000:8000 -v /path/to/my_model:/app/model ettin-reranker-flask
 
 ## API Endpoints
 
-### 1. `/v1/embeddings` (OpenAI Compatible)
+### 1. `/health` or `/ready` (GET)
+
+Checks server initialization status and loaded models.
+
+```bash
+curl http://localhost:8000/health
+
+```
+
+### 2. `/v1/models` (GET)
+
+Returns a list of actively loaded models in OpenAI-compatible format.
+
+```bash
+curl http://localhost:8000/v1/models
+
+```
+
+### 3. `/v1/embeddings` (POST - OpenAI Compatible)
+
+#### For Dense Vector Embeddings (EmbeddingGemma Mode):
 
 ```bash
 curl -X POST http://localhost:8000/v1/embeddings \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "cross-encoder/ettin-reranker-150m-v1",
-    "query": "Which planet is known as the Red Planet?",
-    "input": [
-      "Venus is often called Earth twin because of its size.",
-      "Mars, known for its reddish appearance, is often referred to as the Red Planet."
-    ]
+    "input": ["Artificial intelligence and machine learning.", "Deep learning models."],
+    "model": "google/embeddinggemma-300m"
   }'
 
 ```
 
-### 2. `/v1/rerank` or `/rerank` (Cohere Compatible)
+#### Response Example:
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "object": "embedding",
+      "embedding": [0.012, -0.045, 0.089, "..."],
+      "index": 0
+    }
+  ],
+  "model": "google/embeddinggemma-300m",
+  "usage": {
+    "prompt_tokens": 14,
+    "total_tokens": 14
+  }
+}
+
+```
+
+### 4. `/v1/rerank` or `/rerank` (POST - Cohere Compatible)
 
 ```bash
 curl -X POST http://localhost:8000/v1/rerank \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "cross-encoder/ettin-reranker-150m-v1",
-    "query": "Which planet is known as the Red Planet?",
+    "query": "What is the capital of France?",
     "documents": [
-      "Venus is often called Earth twin because of its size.",
-      "Mars, known for its reddish appearance, is often referred to as the Red Planet."
+      "Paris is the capital of France.",
+      "Tokyo is the capital of Japan."
     ],
-    "top_n": 2,
-    "return_documents": true
+    "top_n": 2
   }'
+
+```
+
+---
+
+## Verification & Test Scripts
+
+* **EmbeddingGemma Verification Test:**
+Tests single string embedding, batch processing, L2 unit-norm constraint, and semantic cosine similarity checks:
+```bash
+python verify_embeddings.py --server-url http://localhost:8000
+
+```
+
+
+* **Ettin Reranker Logits Verification:**
+```bash
+python verify_reference.py --server-url http://localhost:8000
+
+```
+
+
+* **Client Example Integration Suite:**
+```bash
+python client_example.py
 
 ```
