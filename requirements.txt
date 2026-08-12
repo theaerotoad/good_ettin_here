@@ -3,3 +3,4 @@ tokenizers>=0.19.0
 flask>=3.0.0
 numpy>=1.26.0
 safetensors>=0.4.0
+requests>=2.28.0
