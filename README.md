@@ -22,15 +22,13 @@ Next, download the pre-quantized ONNX version of EmbeddingGemma directly using H
 
 ```bash
 hf download onnx-community/embeddinggemma-300m-ONNX  --local-dir ./ettinreranker_model
-
 hf download onnx-community/embeddinggemma-300m-ONNX --local-dir ./embeddinggemma_model
-
 ```
 
 ### Launch the v1 endpoint compatible server
 
 ```bash
-./app/server.py --model-dir ettinreranker_model --embedding-model-dir /home/aerotoad/software/pyplayground/ettin-rerank_share/embeddinggemma --model-type both --host 127.0.0.1 --port 8000
+./app/server.py --model-dir ettinreranker_model --embedding-model-dir ettin-rerank_share/embeddinggemma --model-type both --host 127.0.0.1 --port 8000
 ```
 
 You can kill it with Ctrl-C.
