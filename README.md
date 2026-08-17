@@ -6,28 +6,42 @@ Limited dependancies.  Goal is to have a drop in python library for llama-swap t
 
 ---
 
-## Model Setup & Downloading Models
+## tldr; Getting Set up
 
-### 1. Downloading EmbeddingGemma ONNX
-
-You can download the pre-quantized ONNX version of EmbeddingGemma directly using Hugging Face CLI:
+Clone this repository, then set up a virtual environemnt (recommended):
 
 ```bash
-# Using huggingface-cli
-huggingface-cli download onnx-community/embeddinggemma-300m-ONNX --local-dir ./embeddinggemma_model
+git clone https://github.com/theaerotoad/good_ettin_here
+cd good_ettin_here
+pip install -r requirements.txt
+```
 
-# Or using hf download
+### Downloading Embedings
+
+Next, download the pre-quantized ONNX version of EmbeddingGemma directly using Hugging Face CLI:
+
+```bash
+hf download onnx-community/embeddinggemma-300m-ONNX  --local-dir ./ettinreranker_model
+
 hf download onnx-community/embeddinggemma-300m-ONNX --local-dir ./embeddinggemma_model
 
 ```
 
-### 2. Local Directory Structure Expected
+### Launch the v1 endpoint compatible server
 
-Your local directory structure for models can look like this:
+```bash
+./app/server.py --model-dir ettinreranker_model --embedding-model-dir /home/aerotoad/software/pyplayground/ettin-rerank_share/embeddinggemma --model-type both --host 127.0.0.1 --port 8000
+```
+
+You can kill it with Ctrl-C.
+
+## Local Directory Structure Expected
+
+Your local directory structure for models will look like this:
 
 ```text
 .
-├── model/                     # Ettin Reranker files
+├── ettinreranker_model/                     # Ettin Reranker files
 │   ├── model.onnx (or onnx/model.onnx)
 │   ├── tokenizer.json
 │   ├── 2_Dense.safetensors
@@ -36,23 +50,11 @@ Your local directory structure for models can look like this:
 └── embeddinggemma_model/     # EmbeddingGemma ONNX files
     ├── model.onnx (or model_quantized.onnx)
     └── tokenizer.json
-
 ```
 
----
 
-## Installation
 
-Install required dependencies locally:
-
-```bash
-pip install -r requirements.txt
-
-```
-
----
-
-## CLI Options
+## Other CLI Options
 
 The server accepts command-line arguments (overriding environment variables):
 
@@ -71,35 +73,6 @@ The server accepts command-line arguments (overriding environment variables):
 | `--batch-size` | `BATCH_SIZE` | `32` | Batch size for inference |
 | `--use-gpu` | `USE_GPU` | `false` | Enable CUDA GPU execution provider if available |
 | `--normalize-scores` | `NORMALIZE_SCORES` | `false` | Apply sigmoid score normalization for reranking scores |
-
----
-
-## Running the Server
-
-### 1. Run with Ettin Reranker only:
-
-```bash
-python -m app.server --model-type ettin --model-dir ./model --port 8000
-
-```
-
-### 2. Run with EmbeddingGemma only:
-
-```bash
-python -m app.server --model-type embeddinggemma --model-dir ./embeddinggemma_model --port 8000
-
-```
-
-### 3. Run both Reranker and EmbeddingGemma simultaneously:
-
-```bash
-python -m app.server \
-  --model-type both \
-  --model-dir ./model \
-  --embedding-model-dir ./embeddinggemma_model \
-  --port 8000
-
-```
 
 ---
 
@@ -155,7 +128,6 @@ curl -X POST http://localhost:8000/v1/embeddings \
     "total_tokens": 14
   }
 }
-
 ```
 
 ### 4. `/v1/rerank` or `/rerank` (POST - Cohere Compatible)
@@ -171,7 +143,6 @@ curl -X POST http://localhost:8000/v1/rerank \
     ],
     "top_n": 2
   }'
-
 ```
 
 ---
@@ -182,19 +153,16 @@ curl -X POST http://localhost:8000/v1/rerank \
 Tests single string embedding, batch processing, L2 unit-norm constraint, and semantic cosine similarity checks:
 ```bash
 python verify_embeddings.py --server-url http://localhost:8000
-
 ```
 
 
 * **Ettin Reranker Logits Verification:**
 ```bash
 python verify_reference.py --server-url http://localhost:8000
-
 ```
 
 
 * **Client Example Integration Suite:**
 ```bash
 python client_example.py
-
 ```
