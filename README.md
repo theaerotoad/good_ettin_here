@@ -21,7 +21,7 @@ pip install -r requirements.txt
 Next, download the pre-quantized ONNX version of EmbeddingGemma directly using Hugging Face CLI:
 
 ```bash
-hf download onnx-community/embeddinggemma-300m-ONNX  --local-dir ./ettinreranker_model
+hf download cross-encoder/ettin-reranker-150m-v1  --local-dir ./ettinreranker_model
 hf download onnx-community/embeddinggemma-300m-ONNX --local-dir ./embeddinggemma_model
 ```
 
