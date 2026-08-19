@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import json
 import math
 import base64
@@ -139,33 +140,48 @@ class TableRecognizerONNX:
             logger.warning(f"Could not initialize RapidTable: {e}")
             self.table_engine = None
 
-    def _extract_ocr_tokens(self, img_bgr: np.ndarray) -> list[dict]:
-        """Runs OCR on image crop and returns normalized text boxes with centers and coordinates."""
-        ocr_tokens = []
-        if self.ocr_engine is None:
-            return ocr_tokens
+    @staticmethod
+    def _parse_ocr_raw(ocr_out) -> list:
+        """Extracts the raw list of OCR detections from RapidOCR return structure."""
+        if ocr_out is None:
+            return []
+        if isinstance(ocr_out, (list, tuple)):
+            if len(ocr_out) == 2 and (ocr_out[0] is None or isinstance(ocr_out[0], list)):
+                return ocr_out[0] or []
+            return list(ocr_out)
+        return []
 
-        try:
-            ocr_out = self.ocr_engine(img_bgr)
-            raw_boxes = ocr_out[0] if isinstance(ocr_out, (list, tuple)) and len(ocr_out) > 0 else ocr_out
-            if not raw_boxes or not isinstance(raw_boxes, list):
+    def _extract_ocr_tokens(self, img_bgr: np.ndarray, raw_ocr_res: list = None) -> list[dict]:
+        """Converts raw OCR outputs into normalized text boxes with center points."""
+        ocr_tokens = []
+        raw_boxes = raw_ocr_res
+        if raw_boxes is None and self.ocr_engine is not None:
+            try:
+                ocr_out = self.ocr_engine(img_bgr)
+                raw_boxes = self._parse_ocr_raw(ocr_out)
+            except Exception as e:
+                logger.warning(f"OCR step failed on table crop: {e}")
                 return ocr_tokens
 
-            for item in raw_boxes:
-                if not item or len(item) < 2:
-                    continue
+        if not raw_boxes or not isinstance(raw_boxes, list):
+            return ocr_tokens
 
-                box_pts = item[0]
-                text_val = item[1]
-                if isinstance(text_val, (list, tuple)):
-                    text_str = str(text_val[0])
-                else:
-                    text_str = str(text_val)
+        for item in raw_boxes:
+            if not item or len(item) < 2:
+                continue
 
-                if not text_str.strip():
-                    continue
+            box_pts = item[0]
+            text_val = item[1]
+            if isinstance(text_val, (list, tuple)) and len(text_val) > 0:
+                text_str = str(text_val[0])
+            else:
+                text_str = str(text_val)
 
-                pts = np.asarray(box_pts)
+            if not text_str.strip():
+                continue
+
+            try:
+                pts = np.asarray(box_pts, dtype=np.float32)
                 if pts.ndim == 2 and len(pts) >= 4:
                     x1 = float(np.min(pts[:, 0]))
                     y1 = float(np.min(pts[:, 1]))
@@ -173,6 +189,11 @@ class TableRecognizerONNX:
                     y2 = float(np.max(pts[:, 1]))
                 elif len(box_pts) == 4 and not isinstance(box_pts[0], (list, tuple, np.ndarray)):
                     x1, y1, x2, y2 = float(box_pts[0]), float(box_pts[1]), float(box_pts[2]), float(box_pts[3])
+                elif len(box_pts) == 8:
+                    x1 = float(np.min(box_pts[0::2]))
+                    y1 = float(np.min(box_pts[1::2]))
+                    x2 = float(np.max(box_pts[0::2]))
+                    y2 = float(np.max(box_pts[1::2]))
                 else:
                     continue
 
@@ -181,8 +202,8 @@ class TableRecognizerONNX:
                     "center": ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
                     "text": text_str.strip(),
                 })
-        except Exception as e:
-            logger.warning(f"OCR step failed on table crop: {e}")
+            except Exception:
+                continue
 
         return ocr_tokens
 
@@ -195,7 +216,6 @@ class TableRecognizerONNX:
         if b is None:
             return None
         try:
-            # If b is a tuple/list wrapping box and confidence (e.g. [box, score])
             if (
                 isinstance(b, (list, tuple))
                 and len(b) == 2
@@ -243,7 +263,7 @@ class TableRecognizerONNX:
 
         raw_struct = None
 
-        # Directly invoke table_structure if available (bypasses RapidTable internal OCR wrapper)
+        # Directly invoke table_structure if available
         if hasattr(self.table_engine, "table_structure"):
             try:
                 raw_struct = self.table_engine.table_structure(img_bgr)
@@ -260,11 +280,6 @@ class TableRecognizerONNX:
         if raw_struct is None:
             return pred_structures, pred_bboxes
 
-        # Handle varied return signatures from SLANet / RapidTable:
-        # 1. ((structures, bboxes), elapse)
-        # 2. (structures, bboxes, elapse)
-        # 3. (structures, bboxes)
-        # 4. structures
         if isinstance(raw_struct, (list, tuple)):
             if (
                 len(raw_struct) >= 1
@@ -305,16 +320,33 @@ class TableRecognizerONNX:
         return pred_structures, pred_bboxes
 
     def _match_cells_and_build_html(
-        self, pred_structures: list, pred_bboxes: list, ocr_tokens: list[dict]
+        self,
+        pred_structures: list,
+        pred_bboxes: list,
+        ocr_tokens: list[dict],
+        img_w: int = 1,
+        img_h: int = 1,
     ) -> str:
         """Matches OCR tokens to SLANet cell coordinates and reconstructs full HTML table."""
-        # Standardize cell bounding boxes to [[x1, y1, x2, y2], ...]
         cell_boxes = []
         if pred_bboxes is not None and not isinstance(pred_bboxes, (int, float)):
             for b in pred_bboxes:
                 norm_b = self._normalize_box(b)
                 if norm_b is not None:
-                    cell_boxes.append(norm_b)
+                    bx1, by1, bx2, by2 = norm_b
+                    # If bounding boxes are normalized to [0, 1], scale to image dimensions
+                    if max(bx1, bx2, by1, by2) <= 1.01 and (img_w > 1 or img_h > 1):
+                        bx1 *= img_w
+                        bx2 *= img_w
+                        by1 *= img_h
+                        by2 *= img_h
+                    # If bounding boxes are in SLANet fixed 488x488 scale, scale to image dimensions
+                    elif max(bx2, by2) <= 490.0 and (img_w > 550 or img_h > 550 or img_w < 400 or img_h < 400):
+                        bx1 = (bx1 / 488.0) * img_w
+                        bx2 = (bx2 / 488.0) * img_w
+                        by1 = (by1 / 488.0) * img_h
+                        by2 = (by2 / 488.0) * img_h
+                    cell_boxes.append([bx1, by1, bx2, by2])
 
         # Map each OCR token to its best overlapping or enclosing cell box
         cell_to_tokens = {i: [] for i in range(len(cell_boxes))}
@@ -327,8 +359,8 @@ class TableRecognizerONNX:
             best_overlap = 0.0
 
             for c_idx, (bx1, by1, bx2, by2) in enumerate(cell_boxes):
-                # 1. Point-in-box check (with 3px tolerance)
-                if (bx1 - 3.0) <= cx <= (bx2 + 3.0) and (by1 - 3.0) <= cy <= (by2 + 3.0):
+                # 1. Point-in-box check (with 4px tolerance)
+                if (bx1 - 4.0) <= cx <= (bx2 + 4.0) and (by1 - 4.0) <= cy <= (by2 + 4.0):
                     matched_idx = c_idx
                     break
 
@@ -389,8 +421,9 @@ class TableRecognizerONNX:
         else:
             html_output = ""
 
-        # Fallback: if SLANet output was empty or invalid, build table rows directly from clustered OCR tokens
-        if (not html_output or "<table" not in html_output.lower()) and ocr_tokens:
+        # Fallback: if SLANet output was empty or has no cell text, build table rows directly from clustered OCR tokens
+        text_in_html = re.sub(r"<[^>]+>", "", html_output).strip() if html_output else ""
+        if (not html_output or not text_in_html or "<table" not in html_output.lower()) and ocr_tokens:
             sorted_ocr = sorted(ocr_tokens, key=lambda t: t["bbox"][1])
             rows = []
             curr_row = []
@@ -435,15 +468,40 @@ class TableRecognizerONNX:
         else:
             return {"html": "", "markdown": ""}
 
+        img_h, img_w = img_bgr.shape[:2]
+
         try:
             # 1. OCR text detection on table crop
-            ocr_tokens = self._extract_ocr_tokens(img_bgr)
+            ocr_tokens = []
+            raw_ocr_res = []
+            if self.ocr_engine is not None:
+                try:
+                    ocr_out = self.ocr_engine(img_bgr)
+                    raw_ocr_res = self._parse_ocr_raw(ocr_out)
+                    ocr_tokens = self._extract_ocr_tokens(img_bgr, raw_ocr_res=raw_ocr_res)
+                except Exception as e:
+                    logger.warning(f"RapidOCR text extraction failed: {e}")
 
-            # 2. SLANet table structure inference
-            pred_structures, pred_bboxes = self._extract_slanet_structure(img_bgr)
+            # 2. Invoke RapidTable structure recognition with OCR tokens
+            html_str = ""
+            if self.table_engine is not None:
+                try:
+                    table_out = self.table_engine(img_bgr, raw_ocr_res)
+                    if isinstance(table_out, (list, tuple)) and len(table_out) > 0:
+                        if isinstance(table_out[0], str):
+                            html_str = table_out[0]
+                    elif isinstance(table_out, str):
+                        html_str = table_out
+                except Exception as e:
+                    logger.warning(f"RapidTable direct call failed: {e}")
 
-            # 3. Match cells and construct HTML table
-            html_str = self._match_cells_and_build_html(pred_structures, pred_bboxes, ocr_tokens)
+            # 3. If RapidTable output is empty or cell text is missing, run fallback matcher
+            text_in_html = re.sub(r"<[^>]+>", "", html_str).strip() if html_str else ""
+            if not html_str or not text_in_html or "<table" not in html_str.lower():
+                pred_structures, pred_bboxes = self._extract_slanet_structure(img_bgr)
+                html_str = self._match_cells_and_build_html(
+                    pred_structures, pred_bboxes, ocr_tokens, img_w=img_w, img_h=img_h
+                )
 
             # 4. Convert HTML table to Markdown
             markdown_str = html_table_to_markdown(html_str)
