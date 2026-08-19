@@ -163,49 +163,77 @@ class TableRecognizerONNX:
             self.table_engine = None
 
     def _extract_ocr_tokens(self, img_bgr: np.ndarray) -> list[dict]:
-        """Runs OCR on image crop and returns normalized text boxes with centers and coordinates."""
-        ocr_tokens = []
+        """Runs 2-pass OCR (normal + negated) on image crop and returns deduplicated text boxes."""
         if self.ocr_engine is None:
-            return ocr_tokens
+            return []
 
-        try:
-            ocr_out = self.ocr_engine(img_bgr)
-            raw_boxes = ocr_out[0] if isinstance(ocr_out, (list, tuple)) and len(ocr_out) > 0 else ocr_out
-            if not raw_boxes or not isinstance(raw_boxes, list):
-                return ocr_tokens
+        def run_pass(img_array):
+            toks = []
+            try:
+                ocr_out = self.ocr_engine(img_array)
+                raw_boxes = ocr_out[0] if isinstance(ocr_out, (list, tuple)) and len(ocr_out) > 0 else ocr_out
+                if not raw_boxes or not isinstance(raw_boxes, list):
+                    return toks
 
-            for item in raw_boxes:
-                if not item or len(item) < 2:
-                    continue
+                for item in raw_boxes:
+                    if not item or len(item) < 2:
+                        continue
 
-                box_pts = item[0]
-                text_val = item[1]
-                if isinstance(text_val, (list, tuple)):
-                    text_str = str(text_val[0])
-                else:
-                    text_str = str(text_val)
+                    box_pts = item[0]
+                    text_val = item[1]
+                    text_str = str(text_val[0]) if isinstance(text_val, (list, tuple)) else str(text_val)
 
-                if not text_str.strip():
-                    continue
+                    if not text_str.strip():
+                        continue
 
-                pts = np.asarray(box_pts)
-                if pts.ndim == 2 and len(pts) >= 4:
-                    x1 = float(np.min(pts[:, 0]))
-                    y1 = float(np.min(pts[:, 1]))
-                    x2 = float(np.max(pts[:, 0]))
-                    y2 = float(np.max(pts[:, 1]))
-                elif len(box_pts) == 4 and not isinstance(box_pts[0], (list, tuple, np.ndarray)):
-                    x1, y1, x2, y2 = float(box_pts[0]), float(box_pts[1]), float(box_pts[2]), float(box_pts[3])
-                else:
-                    continue
+                    pts = np.asarray(box_pts)
+                    if pts.ndim == 2 and len(pts) >= 4:
+                        x1 = float(np.min(pts[:, 0]))
+                        y1 = float(np.min(pts[:, 1]))
+                        x2 = float(np.max(pts[:, 0]))
+                        y2 = float(np.max(pts[:, 1]))
+                    elif len(box_pts) == 4 and not isinstance(box_pts[0], (list, tuple, np.ndarray)):
+                        x1, y1, x2, y2 = float(box_pts[0]), float(box_pts[1]), float(box_pts[2]), float(box_pts[3])
+                    else:
+                        continue
 
-                ocr_tokens.append({
-                    "bbox": [x1, y1, x2, y2],
-                    "center": ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
-                    "text": text_str.strip(),
-                })
-        except Exception as e:
-            logger.warning(f"OCR step failed on table crop: {e}")
+                    toks.append({
+                        "bbox": [x1, y1, x2, y2],
+                        "center": ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
+                        "text": text_str.strip(),
+                    })
+            except Exception as e:
+                logger.debug(f"OCR pass failed: {e}")
+            return toks
+
+        normal_tokens = run_pass(img_bgr)
+        negated_tokens = run_pass(255 - img_bgr)
+
+        # Merge and deduplicate tokens (Intersection over Min Area)
+        ocr_tokens = list(normal_tokens)
+        for n_tok in negated_tokens:
+            is_dup = False
+            nx1, ny1, nx2, ny2 = n_tok["bbox"]
+            n_area = max(0, nx2 - nx1) * max(0, ny2 - ny1)
+
+            for m_tok in ocr_tokens:
+                mx1, my1, mx2, my2 = m_tok["bbox"]
+                m_area = max(0, mx2 - mx1) * max(0, my2 - my1)
+
+                ix1, iy1 = max(nx1, mx1), max(ny1, my1)
+                ix2, iy2 = min(nx2, mx2), min(ny2, my2)
+                inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+
+                # If the overlap is significant relative to the smaller bounding box
+                if inter / (min(n_area, m_area) + 1e-9) > 0.4:
+                    is_dup = True
+                    # Favor the longer string (cleaner OCR read on high contrast)
+                    if len(n_tok["text"]) > len(m_tok["text"]) + 2:
+                        m_tok["text"] = n_tok["text"]
+                    break
+
+            if not is_dup:
+                ocr_tokens.append(n_tok)
 
         return ocr_tokens
 
@@ -1260,33 +1288,63 @@ class DocLayNetONNX:
             if needs_ocr:
                 try:
                     img_bgr = np.asarray(img.convert("RGB"))[:, :, ::-1].copy()
-                    ocr_out = self.ocr_engine(img_bgr)
-                    raw_boxes = ocr_out[0] if isinstance(ocr_out, (list, tuple)) and len(ocr_out) > 0 else ocr_out
                     
-                    ocr_tokens = []
-                    if raw_boxes and isinstance(raw_boxes, list):
-                        for item in raw_boxes:
-                            if not item or len(item) < 2: continue
-                            box_pts = item[0]
-                            text_val = item[1]
-                            text_str = str(text_val[0]) if isinstance(text_val, (list, tuple)) else str(text_val)
-                            if not text_str.strip(): continue
-                            
-                            pts = np.asarray(box_pts)
-                            if pts.ndim == 2 and len(pts) >= 4:
-                                x1, y1 = float(np.min(pts[:, 0])), float(np.min(pts[:, 1]))
-                                x2, y2 = float(np.max(pts[:, 0])), float(np.max(pts[:, 1]))
-                            elif len(box_pts) == 4 and not isinstance(box_pts[0], (list, tuple, np.ndarray)):
-                                x1, y1, x2, y2 = float(box_pts[0]), float(box_pts[1]), float(box_pts[2]), float(box_pts[3])
-                            else:
-                                continue
+                    def run_ocr_pass(image_array):
+                        out = self.ocr_engine(image_array)
+                        raw = out[0] if isinstance(out, (list, tuple)) and len(out) > 0 else out
+                        toks = []
+                        if raw and isinstance(raw, list):
+                            for item in raw:
+                                if not item or len(item) < 2: continue
+                                box_pts = item[0]
+                                text_val = item[1]
+                                text_str = str(text_val[0]) if isinstance(text_val, (list, tuple)) else str(text_val)
+                                if not text_str.strip(): continue
                                 
-                            ocr_tokens.append({
-                                "bbox": [x1, y1, x2, y2],
-                                "center": ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
-                                "text": text_str.strip(),
-                                "used": False
-                            })
+                                pts = np.asarray(box_pts)
+                                if pts.ndim == 2 and len(pts) >= 4:
+                                    x1, y1 = float(np.min(pts[:, 0])), float(np.min(pts[:, 1]))
+                                    x2, y2 = float(np.max(pts[:, 0])), float(np.max(pts[:, 1]))
+                                elif len(box_pts) == 4 and not isinstance(box_pts[0], (list, tuple, np.ndarray)):
+                                    x1, y1, x2, y2 = float(box_pts[0]), float(box_pts[1]), float(box_pts[2]), float(box_pts[3])
+                                else:
+                                    continue
+                                    
+                                toks.append({
+                                    "bbox": [x1, y1, x2, y2],
+                                    "center": ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
+                                    "text": text_str.strip(),
+                                    "used": False
+                                })
+                        return toks
+
+                    normal_tokens = run_ocr_pass(img_bgr)
+                    negated_tokens = run_ocr_pass(255 - img_bgr)
+                    
+                    # Merge and deduplicate tokens (Spatial NMS based on Intersection over Min Area)
+                    ocr_tokens = list(normal_tokens)
+                    for n_tok in negated_tokens:
+                        is_dup = False
+                        nx1, ny1, nx2, ny2 = n_tok["bbox"]
+                        n_area = max(0, nx2 - nx1) * max(0, ny2 - ny1)
+                        for m_tok in ocr_tokens:
+                            mx1, my1, mx2, my2 = m_tok["bbox"]
+                            m_area = max(0, mx2 - mx1) * max(0, my2 - my1)
+                            
+                            ix1, iy1 = max(nx1, mx1), max(ny1, my1)
+                            ix2, iy2 = min(nx2, mx2), min(ny2, my2)
+                            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+                            
+                            # If the overlap is significant relative to the smaller bounding box
+                            if inter / (min(n_area, m_area) + 1e-9) > 0.4:
+                                is_dup = True
+                                # Favor the longer string (cleaner OCR read on high contrast)
+                                if len(n_tok["text"]) > len(m_tok["text"]) + 2:
+                                    m_tok["text"] = n_tok["text"]
+                                break
+                        
+                        if not is_dup:
+                            ocr_tokens.append(n_tok)
                     
                     # Map OCR tokens to detected layout regions
                     for det in detections:
