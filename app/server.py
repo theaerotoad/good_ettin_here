@@ -15,7 +15,7 @@ if str(project_root) not in sys.path:
 from flask import Flask, request, jsonify
 
 from app import config
-from app.model import EttinONNXReranker
+from app.model import EttinONNXReranker, DocLayNetONNX
 
 logger = logging.getLogger("ettin-reranker-server")
 logging.basicConfig(level=logging.INFO)
@@ -23,6 +23,7 @@ logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 reranker_model: Optional[EttinONNXReranker] = None
 embedding_model: Optional[object] = None
+doclaynet_model: Optional[DocLayNetONNX] = None
 
 
 @app.after_request
@@ -37,7 +38,7 @@ def add_cors_headers(response):
 @app.route("/healthz", methods=["GET"])
 @app.route("/ready", methods=["GET"])
 def health():
-    if reranker_model is None and embedding_model is None:
+    if reranker_model is None and embedding_model is None and doclaynet_model is None:
         return jsonify({
             "status": "unhealthy",
             "error": "No model initialized"
@@ -48,9 +49,11 @@ def health():
         "model_type": config.MODEL_TYPE,
         "reranker_loaded": reranker_model is not None,
         "embedding_loaded": embedding_model is not None,
+        "doclaynet_loaded": doclaynet_model is not None,
         "model_dir": config.MODEL_DIR,
         "model_name": config.MODEL_NAME,
         "embedding_model_name": config.EMBEDDING_MODEL_NAME,
+        "doclaynet_model_name": config.DOCLAYNET_MODEL_NAME,
         "engine": "onnxruntime",
         "gpu_available": config.USE_GPU,
     }), 200
@@ -72,6 +75,13 @@ def list_models():
             "object": "model",
             "created": int(time.time()),
             "owned_by": "google",
+        })
+    if doclaynet_model is not None:
+        models.append({
+            "id": config.DOCLAYNET_MODEL_NAME,
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": "doclaynet",
         })
     return jsonify({
         "object": "list",
@@ -212,6 +222,102 @@ def create_embeddings():
     })
 
 
+@app.route("/v1/vision/layout", methods=["POST", "OPTIONS"])
+@app.route("/v1/layout/detect", methods=["POST", "OPTIONS"])
+@app.route("/v1/doclaynet", methods=["POST", "OPTIONS"])
+def detect_layout():
+    if request.method == "OPTIONS":
+        return "", 200
+
+    if doclaynet_model is None:
+        return jsonify({"error": {"message": "DocLayNet model server not initialized", "type": "server_error"}}), 503
+
+    conf_thresh = None
+    iou_thresh = None
+    images_to_process = []
+
+    # Check for multipart/form-data upload or JSON payload
+    if request.content_type and "multipart/form-data" in request.content_type:
+        if "confidence_threshold" in request.form:
+            conf_thresh = float(request.form.get("confidence_threshold"))
+        if "iou_threshold" in request.form:
+            iou_thresh = float(request.form.get("iou_threshold"))
+
+        for key in ("file", "image"):
+            if key in request.files:
+                images_to_process.append(request.files[key].read())
+
+        if not images_to_process and request.files:
+            for file_storage in request.files.values():
+                images_to_process.append(file_storage.read())
+    else:
+        payload = request.get_json(force=True, silent=True) or {}
+        if "confidence_threshold" in payload:
+            conf_thresh = float(payload["confidence_threshold"])
+        if "iou_threshold" in payload:
+            iou_thresh = float(payload["iou_threshold"])
+
+        if "image" in payload:
+            images_to_process.append(payload["image"])
+        elif "images" in payload and isinstance(payload["images"], list):
+            images_to_process.extend(payload["images"])
+        elif "input" in payload:
+            inp = payload["input"]
+            if isinstance(inp, list):
+                images_to_process.extend(inp)
+            else:
+                images_to_process.append(inp)
+
+    if not images_to_process:
+        return jsonify({
+            "error": {
+                "message": "No image provided. Pass 'image' (base64 or URL), 'images', or upload a file via multipart form.",
+                "type": "invalid_request_error",
+            }
+        }), 400
+
+    try:
+        results = []
+        for idx, img_input in enumerate(images_to_process):
+            detections, (w, h) = doclaynet_model.predict(
+                img_input,
+                conf_threshold=conf_thresh,
+                iou_threshold=iou_thresh,
+            )
+            results.append({
+                "image_index": idx,
+                "width": w,
+                "height": h,
+                "detections": detections,
+            })
+
+        response_payload = {
+            "model": config.DOCLAYNET_MODEL_NAME,
+            "results": results,
+            "usage": {
+                "total_images": len(images_to_process),
+            },
+        }
+
+        # For single image queries, provide top-level detections directly for convenience
+        if len(results) == 1:
+            response_payload["detections"] = results[0]["detections"]
+            response_payload["image_size"] = {
+                "width": results[0]["width"],
+                "height": results[0]["height"],
+            }
+
+        return jsonify(response_payload)
+    except Exception as e:
+        logger.exception("Error running DocLayNet layout detection")
+        return jsonify({
+            "error": {
+                "message": str(e),
+                "type": "processing_error",
+            }
+        }), 500
+
+
 @app.route("/v1/rerank", methods=["POST", "OPTIONS"])
 @app.route("/rerank", methods=["POST", "OPTIONS"])
 def rerank():
@@ -282,15 +388,21 @@ def main():
         "--model-type",
         type=str,
         default=config.MODEL_TYPE,
-        choices=["ettin", "embeddinggemma", "gemma", "both", "auto"],
-        help="Model type to host: 'ettin', 'embeddinggemma', 'both', or 'auto'",
+        choices=["ettin", "embeddinggemma", "gemma", "doclaynet", "vision", "both", "all", "auto"],
+        help="Model type to host: 'ettin', 'embeddinggemma', 'doclaynet', 'both', 'all', or 'auto'",
     )
     parser.add_argument("--model-dir", type=str, default=config.MODEL_DIR, help="Path to local directory with model files")
     parser.add_argument("--onnx-path", type=str, default=config.ONNX_PATH, help="Direct path to model.onnx file")
     parser.add_argument("--embedding-model-dir", type=str, default=config.EMBEDDING_MODEL_DIR, help="Path to EmbeddingGemma directory (if different from model-dir)")
     parser.add_argument("--embedding-onnx-path", type=str, default=config.EMBEDDING_ONNX_PATH, help="Direct path to EmbeddingGemma ONNX file")
+    parser.add_argument("--doclaynet-model-dir", type=str, default=config.DOCLAYNET_MODEL_DIR, help="Path to DocLayNet directory (if different from model-dir)")
+    parser.add_argument("--doclaynet-onnx-path", type=str, default=config.DOCLAYNET_ONNX_PATH, help="Direct path to DocLayNet YOLO ONNX file")
     parser.add_argument("--model-name", type=str, default=config.MODEL_NAME, help="Model identifier for reranker")
     parser.add_argument("--embedding-model-name", type=str, default=config.EMBEDDING_MODEL_NAME, help="Model identifier for EmbeddingGemma")
+    parser.add_argument("--doclaynet-model-name", type=str, default=config.DOCLAYNET_MODEL_NAME, help="Model identifier for DocLayNet")
+    parser.add_argument("--conf-threshold", type=float, default=config.DOCLAYNET_CONF_THRESHOLD, help="Confidence threshold for DocLayNet object detection")
+    parser.add_argument("--iou-threshold", type=float, default=config.DOCLAYNET_IOU_THRESHOLD, help="IoU NMS threshold for DocLayNet")
+    parser.add_argument("--image-size", type=int, default=config.DOCLAYNET_IMAGE_SIZE, help="Input image dimension for YOLOv8 DocLayNet (default 640)")
     parser.add_argument("--host", type=str, default=config.HOST, help="Host address to bind to")
     parser.add_argument("--port", type=int, default=config.PORT, help="Port to bind to")
     parser.add_argument("--max-length", type=int, default=config.MAX_LENGTH, help="Maximum token sequence length")
@@ -307,8 +419,14 @@ def main():
     config.ONNX_PATH = args.onnx_path
     config.EMBEDDING_MODEL_DIR = args.embedding_model_dir or args.model_dir
     config.EMBEDDING_ONNX_PATH = args.embedding_onnx_path or args.onnx_path
+    config.DOCLAYNET_MODEL_DIR = args.doclaynet_model_dir or args.model_dir
+    config.DOCLAYNET_ONNX_PATH = args.doclaynet_onnx_path or args.onnx_path
     config.MODEL_NAME = args.model_name
     config.EMBEDDING_MODEL_NAME = args.embedding_model_name
+    config.DOCLAYNET_MODEL_NAME = args.doclaynet_model_name
+    config.DOCLAYNET_CONF_THRESHOLD = args.conf_threshold
+    config.DOCLAYNET_IOU_THRESHOLD = args.iou_threshold
+    config.DOCLAYNET_IMAGE_SIZE = args.image_size
     config.HOST = args.host
     config.PORT = args.port
     config.MAX_LENGTH = args.max_length
@@ -316,8 +434,8 @@ def main():
     config.USE_GPU = args.use_gpu
     config.NORMALIZE_SCORES = args.normalize_scores
 
-    global reranker_model, embedding_model
-    from app.model import EttinONNXReranker, EmbeddingGemmaONNX
+    global reranker_model, embedding_model, doclaynet_model
+    from app.model import EttinONNXReranker, EmbeddingGemmaONNX, DocLayNetONNX
 
     model_type = config.MODEL_TYPE.lower()
 
@@ -354,7 +472,25 @@ def main():
                 raise e
             logger.warning(f"Could not load EmbeddingGemma model: {e}")
 
-    if reranker_model is None and embedding_model is None:
+    # 3. Initialize DocLayNet if requested
+    if model_type in ("doclaynet", "vision", "all", "auto"):
+        try:
+            doc_dir = config.DOCLAYNET_MODEL_DIR
+            logger.info(f"Initializing DocLayNet YOLOv8 model from directory: {doc_dir}")
+            doclaynet_model = DocLayNetONNX(
+                model_dir=doc_dir,
+                onnx_path=config.DOCLAYNET_ONNX_PATH,
+                conf_threshold=config.DOCLAYNET_CONF_THRESHOLD,
+                iou_threshold=config.DOCLAYNET_IOU_THRESHOLD,
+                image_size=config.DOCLAYNET_IMAGE_SIZE,
+                use_gpu=config.USE_GPU,
+            )
+        except Exception as e:
+            if model_type in ("doclaynet", "vision"):
+                raise e
+            logger.warning(f"Could not load DocLayNet model: {e}")
+
+    if reranker_model is None and embedding_model is None and doclaynet_model is None:
         logger.error("Failed to load any model!")
         sys.exit(1)
 

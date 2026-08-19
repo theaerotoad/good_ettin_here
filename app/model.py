@@ -1,8 +1,12 @@
 import os
+import io
 import math
+import base64
 import logging
+import requests
 import numpy as np
 import onnxruntime as ort
+from PIL import Image
 from tokenizers import Tokenizer
 from safetensors.numpy import load_file
 
@@ -409,3 +413,251 @@ class EmbeddingGemmaONNX:
                 all_embeddings.append([float(x) for x in vec])
 
         return all_embeddings, total_tokens
+
+
+class DocLayNetONNX:
+    """
+    Pure ONNX-based YOLOv8 document layout detection model for DocLayNet.
+    Detects 11 distinct document regions:
+    0: Caption, 1: Footnote, 2: Formula, 3: List-item, 4: Page-footer,
+    5: Page-header, 6: Picture, 7: Section-header, 8: Table, 9: Text, 10: Title
+    """
+
+    DOCLAYNET_LABELS = [
+        "Caption",
+        "Footnote",
+        "Formula",
+        "List-item",
+        "Page-footer",
+        "Page-header",
+        "Picture",
+        "Section-header",
+        "Table",
+        "Text",
+        "Title",
+    ]
+
+    def __init__(
+        self,
+        model_dir: str = "./model",
+        onnx_path: str = None,
+        conf_threshold: float = 0.25,
+        iou_threshold: float = 0.45,
+        image_size: int = 640,
+        use_gpu: bool = False,
+    ):
+        self.model_dir = model_dir
+        self.conf_threshold = conf_threshold
+        self.iou_threshold = iou_threshold
+        self.image_size = image_size
+        self.labels = self.DOCLAYNET_LABELS
+
+        # 1. Locate ONNX model file
+        if onnx_path and os.path.exists(onnx_path):
+            actual_onnx_path = onnx_path
+        else:
+            candidates = [
+                os.path.join(model_dir, "onnx", "yolov8n-doclaynet.onnx"),
+                os.path.join(model_dir, "yolov8n-doclaynet.onnx"),
+                os.path.join(model_dir, "model.onnx"),
+                os.path.join(model_dir, "doclaynet.onnx"),
+                os.path.join(model_dir, "model_quantized.onnx"),
+            ]
+            actual_onnx_path = None
+            for cand in candidates:
+                if os.path.exists(cand):
+                    actual_onnx_path = cand
+                    break
+
+            if not actual_onnx_path:
+                raise FileNotFoundError(
+                    f"No ONNX DocLayNet model found in '{model_dir}'. Checked: {candidates}"
+                )
+
+        logger.info(f"Loading YOLOv8 DocLayNet ONNX model from {actual_onnx_path}...")
+
+        # 2. Select ONNX execution providers
+        available_providers = ort.get_available_providers()
+        providers = []
+        if use_gpu and "CUDAExecutionProvider" in available_providers:
+            providers.append("CUDAExecutionProvider")
+        providers.append("CPUExecutionProvider")
+
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+        logger.info(f"Initializing ONNX DocLayNet InferenceSession with providers: {providers}")
+        self.session = ort.InferenceSession(actual_onnx_path, sess_options, providers=providers)
+        self.input_names = [inp.name for inp in self.session.get_inputs()]
+        self.output_names = [out.name for out in self.session.get_outputs()]
+        logger.info(f"DocLayNet ONNX inputs expected: {self.input_names}")
+        logger.info(f"DocLayNet ONNX outputs expected: {self.output_names}")
+
+    def _load_image(self, image_input) -> Image.Image:
+        """Loads and converts image inputs (PIL Image, bytes, base64 data URI, HTTP URL, or local path) to RGB."""
+        if isinstance(image_input, Image.Image):
+            return image_input.convert("RGB")
+        if isinstance(image_input, bytes):
+            return Image.open(io.BytesIO(image_input)).convert("RGB")
+        if isinstance(image_input, str):
+            if image_input.startswith("data:image"):
+                base64_data = image_input.split(",", 1)[1]
+                return Image.open(io.BytesIO(base64.b64decode(base64_data))).convert("RGB")
+            if image_input.startswith("http://") or image_input.startswith("https://"):
+                resp = requests.get(image_input, timeout=15)
+                resp.raise_for_status()
+                return Image.open(io.BytesIO(resp.content)).convert("RGB")
+            if os.path.exists(image_input):
+                return Image.open(image_input).convert("RGB")
+            try:
+                raw_bytes = base64.b64decode(image_input)
+                return Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+            except Exception:
+                raise ValueError(f"Could not decode image string: {image_input[:60]}...")
+        raise TypeError(f"Unsupported image input type: {type(image_input)}")
+
+    def _letterbox(
+        self, image: Image.Image, target_size: int = 640
+    ) -> tuple[np.ndarray, float, tuple[float, float]]:
+        """
+        Resize image with constant aspect ratio and pad to (target_size, target_size).
+        Returns normalized tensor (1, 3, target_size, target_size), scale factor, and (pad_w, pad_h).
+        """
+        orig_w, orig_h = image.size
+        scale = min(target_size / orig_w, target_size / orig_h)
+        new_w = int(round(orig_w * scale))
+        new_h = int(round(orig_h * scale))
+
+        resized = image.resize((new_w, new_h), Image.Resampling.BILINEAR)
+
+        pad_w = (target_size - new_w) / 2.0
+        pad_h = (target_size - new_h) / 2.0
+
+        canvas = Image.new("RGB", (target_size, target_size), (114, 114, 114))
+        canvas.paste(resized, (int(round(pad_w)), int(round(pad_h))))
+
+        img_data = np.asarray(canvas, dtype=np.float32) / 255.0  # HWC
+        img_data = np.transpose(img_data, (2, 0, 1))            # CHW
+        img_tensor = np.expand_dims(img_data, axis=0)           # 1, C, H, W
+
+        return img_tensor, scale, (pad_w, pad_h)
+
+    def _nms(
+        self, boxes: np.ndarray, scores: np.ndarray, class_ids: np.ndarray, iou_threshold: float
+    ) -> list[int]:
+        """Class-aware Non-Maximum Suppression (NMS)."""
+        if len(boxes) == 0:
+            return []
+
+        keep = []
+        unique_classes = np.unique(class_ids)
+
+        for c in unique_classes:
+            cls_indices = np.where(class_ids == c)[0]
+            cls_boxes = boxes[cls_indices]
+            cls_scores = scores[cls_indices]
+
+            x1 = cls_boxes[:, 0]
+            y1 = cls_boxes[:, 1]
+            x2 = cls_boxes[:, 2]
+            y2 = cls_boxes[:, 3]
+            areas = (x2 - x1) * (y2 - y1)
+            order = cls_scores.argsort()[::-1]
+
+            while order.size > 0:
+                i = order[0]
+                keep.append(cls_indices[i])
+                if order.size == 1:
+                    break
+
+                xx1 = np.maximum(x1[i], x1[order[1:]])
+                yy1 = np.maximum(y1[i], y1[order[1:]])
+                xx2 = np.minimum(x2[i], x2[order[1:]])
+                yy2 = np.minimum(y2[i], y2[order[1:]])
+
+                w = np.maximum(0.0, xx2 - xx1)
+                h = np.maximum(0.0, yy2 - yy1)
+                inter = w * h
+                iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-9)
+
+                inds = np.where(iou <= iou_threshold)[0]
+                order = order[inds + 1]
+
+        return sorted(keep, key=lambda idx: scores[idx], reverse=True)
+
+    def predict(
+        self,
+        image_input,
+        conf_threshold: float = None,
+        iou_threshold: float = None,
+    ) -> tuple[list[dict], tuple[int, int]]:
+        """
+        Detect document layout elements in an image.
+        Returns (list_of_detections, (orig_width, orig_height)).
+        """
+        conf_thresh = conf_threshold if conf_threshold is not None else self.conf_threshold
+        iou_thresh = iou_threshold if iou_threshold is not None else self.iou_threshold
+
+        img = self._load_image(image_input)
+        orig_w, orig_h = img.size
+
+        img_tensor, scale, (pad_w, pad_h) = self._letterbox(img, target_size=self.image_size)
+
+        onnx_inputs = {self.input_names[0]: img_tensor}
+        outputs = self.session.run(None, onnx_inputs)
+        raw_output = outputs[0]  # Shape: (1, 15, anchors) or (1, anchors, 15)
+
+        predictions = np.squeeze(raw_output, axis=0)
+
+        # Standard YOLOv8 output is (num_features, num_anchors) where features = 4 + num_classes
+        if predictions.shape[0] == (4 + len(self.labels)):
+            predictions = np.transpose(predictions, (1, 0))  # (num_anchors, 15)
+
+        boxes_cxcywh = predictions[:, :4]
+        class_scores = predictions[:, 4:]
+
+        max_scores = np.max(class_scores, axis=1)
+        class_ids = np.argmax(class_scores, axis=1)
+
+        # Confidence filter
+        mask = max_scores >= conf_thresh
+        if not np.any(mask):
+            return [], (orig_w, orig_h)
+
+        valid_boxes = boxes_cxcywh[mask]
+        valid_scores = max_scores[mask]
+        valid_class_ids = class_ids[mask]
+
+        # Convert [center_x, center_y, width, height] in letterbox space to [x1, y1, x2, y2] in original image space
+        x1 = (valid_boxes[:, 0] - valid_boxes[:, 2] / 2.0 - pad_w) / scale
+        y1 = (valid_boxes[:, 1] - valid_boxes[:, 3] / 2.0 - pad_h) / scale
+        x2 = (valid_boxes[:, 0] + valid_boxes[:, 2] / 2.0 - pad_w) / scale
+        y2 = (valid_boxes[:, 1] + valid_boxes[:, 3] / 2.0 - pad_h) / scale
+
+        x1 = np.clip(x1, 0, orig_w)
+        y1 = np.clip(y1, 0, orig_h)
+        x2 = np.clip(x2, 0, orig_w)
+        y2 = np.clip(y2, 0, orig_h)
+
+        boxes_xyxy = np.column_stack([x1, y1, x2, y2])
+
+        # Apply NMS
+        keep_indices = self._nms(boxes_xyxy, valid_scores, valid_class_ids, iou_threshold=iou_thresh)
+
+        detections = []
+        for idx in keep_indices:
+            cid = int(valid_class_ids[idx])
+            label_name = self.labels[cid] if cid < len(self.labels) else f"class_{cid}"
+            detections.append({
+                "bbox": [
+                    round(float(boxes_xyxy[idx, 0]), 2),
+                    round(float(boxes_xyxy[idx, 1]), 2),
+                    round(float(boxes_xyxy[idx, 2]), 2),
+                    round(float(boxes_xyxy[idx, 3]), 2),
+                ],
+                "confidence": round(float(valid_scores[idx]), 4),
+                "class_id": cid,
+                "label": label_name,
+            })
+
+        return detections, (orig_w, orig_h)
