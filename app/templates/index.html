@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ettin API Tester</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50 text-gray-800 font-sans p-6">
+    <div class="max-w-5xl mx-auto space-y-8">
+        <header class="border-b pb-4">
+            <h1 class="text-3xl font-bold text-gray-900">Ettin API Tester</h1>
+            <p class="text-gray-500 mt-2">Lightweight interface to test available ONNX model endpoints.</p>
+        </header>
+
+        <!-- Container for Endpoints -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            
+            <!-- Health & Models -->
+            <div class="space-y-6">
+                <!-- Health Endpoint -->
+                <div class="bg-white p-5 rounded-lg shadow-sm border border-gray-200">
+                    <h2 class="text-xl font-semibold mb-2">GET /health</h2>
+                    <p class="text-sm text-gray-600 mb-4">Check server status and loaded models.</p>
+                    <button onclick="testEndpoint('/health', 'GET', null, 'health-res')" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm transition focus:outline-none focus:ring-2 focus:ring-blue-500">Test /health</button>
+                    <pre id="health-res" class="mt-4 bg-gray-50 p-3 rounded text-xs overflow-auto max-h-48 border border-gray-100 text-gray-700"></pre>
+                </div>
+
+                <!-- Models Endpoint -->
+                <div class="bg-white p-5 rounded-lg shadow-sm border border-gray-200">
+                    <h2 class="text-xl font-semibold mb-2">GET /v1/models</h2>
+                    <p class="text-sm text-gray-600 mb-4">List available loaded models.</p>
+                    <button onclick="testEndpoint('/v1/models', 'GET', null, 'models-res')" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm transition focus:outline-none focus:ring-2 focus:ring-blue-500">Test /v1/models</button>
+                    <pre id="models-res" class="mt-4 bg-gray-50 p-3 rounded text-xs overflow-auto max-h-48 border border-gray-100 text-gray-700"></pre>
+                </div>
+            </div>
+
+            <!-- Embeddings -->
+            <div class="bg-white p-5 rounded-lg shadow-sm border border-gray-200">
+                <h2 class="text-xl font-semibold mb-2">POST /v1/embeddings</h2>
+                <p class="text-sm text-gray-600 mb-4">Generate dense vector embeddings.</p>
+                <textarea id="emb-input" class="w-full border border-gray-300 rounded p-3 text-sm font-mono h-24 mb-3 focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder='{"input": ["Hello world", "How are you?"]}'></textarea>
+                <button onclick="testEndpoint('/v1/embeddings', 'POST', document.getElementById('emb-input').value, 'emb-res')" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm transition focus:outline-none focus:ring-2 focus:ring-blue-500">Test Embeddings</button>
+                <pre id="emb-res" class="mt-4 bg-gray-50 p-3 rounded text-xs overflow-auto max-h-48 border border-gray-100 text-gray-700"></pre>
+            </div>
+
+            <!-- Rerank -->
+            <div class="bg-white p-5 rounded-lg shadow-sm border border-gray-200">
+                <h2 class="text-xl font-semibold mb-2">POST /v1/rerank</h2>
+                <p class="text-sm text-gray-600 mb-4">Cross-encoder relevance scoring.</p>
+                <textarea id="rerank-input" class="w-full border border-gray-300 rounded p-3 text-sm font-mono h-32 mb-3 focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder='{"query": "What is Paris?", "documents": ["Paris is the capital of France.", "London is in the UK."]}'></textarea>
+                <button onclick="testEndpoint('/v1/rerank', 'POST', document.getElementById('rerank-input').value, 'rerank-res')" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm transition focus:outline-none focus:ring-2 focus:ring-blue-500">Test Rerank</button>
+                <pre id="rerank-res" class="mt-4 bg-gray-50 p-3 rounded text-xs overflow-auto max-h-48 border border-gray-100 text-gray-700"></pre>
+            </div>
+
+            <!-- Vision Layout -->
+            <div class="bg-white p-5 rounded-lg shadow-sm border border-gray-200">
+                <h2 class="text-xl font-semibold mb-2">POST /v1/vision/layout</h2>
+                <p class="text-sm text-gray-600 mb-4">DocLayNet YOLOv8 Document Layout Analysis.</p>
+                <input type="file" id="layout-file" class="mb-4 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 focus:outline-none" />
+                <button onclick="testMultipart('/v1/vision/layout', 'layout-file', 'layout-res')" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm transition focus:outline-none focus:ring-2 focus:ring-blue-500">Test Layout</button>
+                <pre id="layout-res" class="mt-4 bg-gray-50 p-3 rounded text-xs overflow-auto max-h-48 border border-gray-100 text-gray-700"></pre>
+            </div>
+
+            <!-- Vision Table -->
+            <div class="bg-white p-5 rounded-lg shadow-sm border border-gray-200">
+                <h2 class="text-xl font-semibold mb-2">POST /v1/vision/table</h2>
+                <p class="text-sm text-gray-600 mb-4">RapidTable SLANet structure extraction.</p>
+                <input type="file" id="table-file" class="mb-4 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 focus:outline-none" />
+                <button onclick="testMultipart('/v1/vision/table', 'table-file', 'table-res')" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm transition focus:outline-none focus:ring-2 focus:ring-blue-500">Test Table</button>
+                <pre id="table-res" class="mt-4 bg-gray-50 p-3 rounded text-xs overflow-auto max-h-48 border border-gray-100 text-gray-700"></pre>
+            </div>
+
+        </div>
+    </div>
+
+    <script>
+        // Set default values for textareas
+        document.getElementById('emb-input').value = JSON.stringify({
+            input: ["What is Ettin?", "A fast ONNX model running locally."]
+        }, null, 2);
+        
+        document.getElementById('rerank-input').value = JSON.stringify({
+            query: "What is Ettin?",
+            documents: ["Ettin is a lightweight ONNX Reranker.", "The sky is clear today."]
+        }, null, 2);
+
+        async function testEndpoint(url, method, body, resId) {
+            const resEl = document.getElementById(resId);
+            resEl.textContent = "Loading...";
+            try {
+                const options = { method };
+                if (body) {
+                    options.headers = { 'Content-Type': 'application/json' };
+                    options.body = body;
+                }
+                const response = await fetch(url, options);
+                const data = await response.json();
+                resEl.textContent = JSON.stringify(data, null, 2);
+            } catch (err) {
+                resEl.textContent = "Error: " + err.message;
+            }
+        }
+
+        async function testMultipart(url, fileId, resId) {
+            const resEl = document.getElementById(resId);
+            const fileInput = document.getElementById(fileId);
+            if (!fileInput.files.length) {
+                resEl.textContent = "Please select an image file first.";
+                return;
+            }
+            resEl.textContent = "Loading...";
+            try {
+                const formData = new FormData();
+                formData.append("file", fileInput.files[0]);
+                
+                const response = await fetch(url, {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await response.json();
+                resEl.textContent = JSON.stringify(data, null, 2);
+            } catch (err) {
+                resEl.textContent = "Error: " + err.message;
+            }
+        }
+    </script>
+</body>
+</html>
