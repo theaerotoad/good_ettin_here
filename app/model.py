@@ -1,6 +1,5 @@
 import os
 import io
-import re
 import json
 import math
 import base64
@@ -45,25 +44,48 @@ def html_table_to_markdown(html_content: str) -> str:
             if not rows:
                 continue
 
-            grid = []
-            max_cols = 0
+            grid_dict = {}
+            r = 0
             for row in rows:
+                c = 0
                 cells = row.find_all(["th", "td"])
-                row_data = []
                 for cell in cells:
+                    # Skip cells that are already filled by a previous rowspan/colspan
+                    while (r, c) in grid_dict:
+                        c += 1
+                    
                     text = cell.get_text(separator=" ", strip=True)
                     text = text.replace("|", "\\|").replace("\n", " ").strip()
-                    row_data.append(text)
-                if row_data:
-                    grid.append(row_data)
-                    max_cols = max(max_cols, len(row_data))
+                    
+                    try:
+                        colspan = int(cell.get("colspan", 1))
+                    except (ValueError, TypeError):
+                        colspan = 1
+                        
+                    try:
+                        rowspan = int(cell.get("rowspan", 1))
+                    except (ValueError, TypeError):
+                        rowspan = 1
+                        
+                    # Populate the grid coordinates covered by this cell
+                    for i in range(rowspan):
+                        for j in range(colspan):
+                            grid_dict[(r + i, c + j)] = text
+                    
+                    c += colspan
+                r += 1
 
-            if not grid or max_cols == 0:
+            if not grid_dict:
                 continue
 
-            for row in grid:
-                while len(row) < max_cols:
-                    row.append("")
+            max_r = max(k[0] for k in grid_dict.keys())
+            max_c = max(k[1] for k in grid_dict.keys())
+            max_cols = max_c + 1
+
+            grid = []
+            for i in range(max_r + 1):
+                row_data = [grid_dict.get((i, j), "") for j in range(max_cols)]
+                grid.append(row_data)
 
             col_widths = [3] * max_cols
             for row in grid:
@@ -140,70 +162,97 @@ class TableRecognizerONNX:
             logger.warning(f"Could not initialize RapidTable: {e}")
             self.table_engine = None
 
-    @staticmethod
-    def _parse_ocr_raw(ocr_out) -> list:
-        """Extracts the raw list of OCR detections from RapidOCR return structure."""
-        if ocr_out is None:
+    def _extract_ocr_tokens(self, img_bgr: np.ndarray) -> list[dict]:
+        """Runs 2-pass OCR (normal + negated) on image crop and returns deduplicated text boxes."""
+        if self.ocr_engine is None:
             return []
-        if isinstance(ocr_out, (list, tuple)):
-            if len(ocr_out) == 2 and (ocr_out[0] is None or isinstance(ocr_out[0], list)):
-                return ocr_out[0] or []
-            return list(ocr_out)
-        return []
 
-    def _extract_ocr_tokens(self, img_bgr: np.ndarray, raw_ocr_res: list = None) -> list[dict]:
-        """Converts raw OCR outputs into normalized text boxes with center points."""
-        ocr_tokens = []
-        raw_boxes = raw_ocr_res
-        if raw_boxes is None and self.ocr_engine is not None:
+        def run_pass(img_array):
+            toks = []
             try:
-                ocr_out = self.ocr_engine(img_bgr)
-                raw_boxes = self._parse_ocr_raw(ocr_out)
+                ocr_out = self.ocr_engine(img_array)
+                raw_boxes = ocr_out[0] if isinstance(ocr_out, (list, tuple)) and len(ocr_out) > 0 else ocr_out
+                if not raw_boxes or not isinstance(raw_boxes, list):
+                    return toks
+
+                for item in raw_boxes:
+                    if not item or len(item) < 2:
+                        continue
+
+                    box_pts = item[0]
+                    text_val = item[1]
+                    text_str = str(text_val[0]) if isinstance(text_val, (list, tuple)) else str(text_val)
+                    text_str = text_str.strip()
+                    if not text_str:
+                        continue
+
+                    pts = np.asarray(box_pts)
+                    if pts.ndim == 2 and len(pts) >= 4:
+                        x1 = float(np.min(pts[:, 0]))
+                        y1 = float(np.min(pts[:, 1]))
+                        x2 = float(np.max(pts[:, 0]))
+                        y2 = float(np.max(pts[:, 1]))
+                    elif len(box_pts) == 4 and not isinstance(box_pts[0], (list, tuple, np.ndarray)):
+                        x1, y1, x2, y2 = float(box_pts[0]), float(box_pts[1]), float(box_pts[2]), float(box_pts[3])
+                    else:
+                        continue
+
+                    # Heuristic cleanup for missing spaces
+                    import re
+                    text_clean = re.sub(r'([.,:;!?])([A-Za-z])', r'\1 \2', text_str)
+                    text_clean = re.sub(r'([a-z])([A-Z])', r'\1 \2', text_clean)
+
+                    toks.append({
+                        "bbox": [x1, y1, x2, y2],
+                        "center": ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
+                        "text": text_clean,
+                    })
             except Exception as e:
-                logger.warning(f"OCR step failed on table crop: {e}")
-                return ocr_tokens
+                logger.debug(f"OCR pass failed: {e}")
+            return toks
 
-        if not raw_boxes or not isinstance(raw_boxes, list):
-            return ocr_tokens
+        # Heuristic to skip unnecessary OCR passes based on crop polarity
+        gray = np.dot(img_bgr[..., :3], [0.114, 0.587, 0.299])
+        total_px = gray.size
+        run_normal = True
+        run_negated = True
 
-        for item in raw_boxes:
-            if not item or len(item) < 2:
-                continue
+        if total_px > 0:
+            light_pct = np.sum(gray > 170) / total_px
+            dark_pct = np.sum(gray < 85) / total_px
+            if light_pct > 0.85:
+                run_negated = False
+            elif dark_pct > 0.85:
+                run_normal = False
 
-            box_pts = item[0]
-            text_val = item[1]
-            if isinstance(text_val, (list, tuple)) and len(text_val) > 0:
-                text_str = str(text_val[0])
-            else:
-                text_str = str(text_val)
+        normal_tokens = run_pass(img_bgr) if run_normal else []
+        negated_tokens = run_pass(255 - img_bgr) if run_negated else []
 
-            if not text_str.strip():
-                continue
+        # Merge and deduplicate tokens (Intersection over Min Area)
+        ocr_tokens = list(normal_tokens)
+        for n_tok in negated_tokens:
+            is_dup = False
+            nx1, ny1, nx2, ny2 = n_tok["bbox"]
+            n_area = max(0, nx2 - nx1) * max(0, ny2 - ny1)
 
-            try:
-                pts = np.asarray(box_pts, dtype=np.float32)
-                if pts.ndim == 2 and len(pts) >= 4:
-                    x1 = float(np.min(pts[:, 0]))
-                    y1 = float(np.min(pts[:, 1]))
-                    x2 = float(np.max(pts[:, 0]))
-                    y2 = float(np.max(pts[:, 1]))
-                elif len(box_pts) == 4 and not isinstance(box_pts[0], (list, tuple, np.ndarray)):
-                    x1, y1, x2, y2 = float(box_pts[0]), float(box_pts[1]), float(box_pts[2]), float(box_pts[3])
-                elif len(box_pts) == 8:
-                    x1 = float(np.min(box_pts[0::2]))
-                    y1 = float(np.min(box_pts[1::2]))
-                    x2 = float(np.max(box_pts[0::2]))
-                    y2 = float(np.max(box_pts[1::2]))
-                else:
-                    continue
+            for m_tok in ocr_tokens:
+                mx1, my1, mx2, my2 = m_tok["bbox"]
+                m_area = max(0, mx2 - mx1) * max(0, my2 - my1)
 
-                ocr_tokens.append({
-                    "bbox": [x1, y1, x2, y2],
-                    "center": ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
-                    "text": text_str.strip(),
-                })
-            except Exception:
-                continue
+                ix1, iy1 = max(nx1, mx1), max(ny1, my1)
+                ix2, iy2 = min(nx2, mx2), min(ny2, my2)
+                inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+
+                # If the overlap is significant relative to the smaller bounding box
+                if inter / (min(n_area, m_area) + 1e-9) > 0.4:
+                    is_dup = True
+                    # Favor the longer string (cleaner OCR read on high contrast)
+                    if len(n_tok["text"]) > len(m_tok["text"]) + 2:
+                        m_tok["text"] = n_tok["text"]
+                    break
+
+            if not is_dup:
+                ocr_tokens.append(n_tok)
 
         return ocr_tokens
 
@@ -216,6 +265,7 @@ class TableRecognizerONNX:
         if b is None:
             return None
         try:
+            # If b is a tuple/list wrapping box and confidence (e.g. [box, score])
             if (
                 isinstance(b, (list, tuple))
                 and len(b) == 2
@@ -263,50 +313,50 @@ class TableRecognizerONNX:
 
         raw_struct = None
 
-        # Directly invoke table_structure if available
-        if hasattr(self.table_engine, "table_structure"):
-            try:
-                raw_struct = self.table_engine.table_structure(img_bgr)
-            except Exception as e:
-                logger.debug(f"SLANet table_structure call failed: {e}")
+        # 1. Try to bypass RapidTable's internal OCR wrapper by accessing the core SLANet model directly
+        for attr in ["table_model", "table_structure", "structure_model", "model"]:
+            if hasattr(self.table_engine, attr):
+                internal_model = getattr(self.table_engine, attr)
+                if callable(internal_model):
+                    try:
+                        raw_struct = internal_model(img_bgr)
+                        if raw_struct is not None:
+                            break
+                    except Exception as e:
+                        logger.warning(f"Internal model '{attr}' call failed: {e}")
 
-        # Fallback to direct call on table_engine
+        # 2. Fallback to direct call on table_engine
         if raw_struct is None:
             try:
                 raw_struct = self.table_engine(img_bgr)
             except Exception as e:
-                logger.debug(f"SLANet direct call failed: {e}")
+                logger.warning(f"SLANet direct call failed: {e}")
 
         if raw_struct is None:
             return pred_structures, pred_bboxes
 
+        # 3. Robust unpacking: Find structures (strings/tags) and bboxes (coords) dynamically
+        candidates = []
         if isinstance(raw_struct, (list, tuple)):
-            if (
-                len(raw_struct) >= 1
-                and isinstance(raw_struct[0], (list, tuple))
-                and len(raw_struct[0]) == 2
-                and not isinstance(raw_struct[0][0], str)
-            ):
-                pred_structures = raw_struct[0][0]
-                pred_bboxes = raw_struct[0][1]
-            elif len(raw_struct) == 3 and isinstance(raw_struct[2], (int, float, np.floating, np.integer)):
-                pred_structures = raw_struct[0]
-                pred_bboxes = raw_struct[1]
-            elif len(raw_struct) >= 2 and (
-                isinstance(raw_struct[1], (list, np.ndarray))
-                or not isinstance(raw_struct[1], (int, float, np.floating, np.integer))
-            ):
-                pred_structures = raw_struct[0]
-                pred_bboxes = raw_struct[1]
-            elif len(raw_struct) >= 1:
-                if isinstance(raw_struct[0], (list, tuple)) and len(raw_struct[0]) == 2:
-                    pred_structures = raw_struct[0][0]
-                    pred_bboxes = raw_struct[0][1]
+            for item in raw_struct:
+                if isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[0], (list, tuple)):
+                    candidates.extend([item[0], item[1]])
                 else:
-                    pred_structures = raw_struct[0]
-                    if len(raw_struct) >= 2 and not isinstance(raw_struct[1], (int, float, np.floating, np.integer)):
-                        pred_bboxes = raw_struct[1]
-        elif isinstance(raw_struct, str):
+                    candidates.append(item)
+        else:
+            candidates = [raw_struct]
+
+        for cand in candidates:
+            if isinstance(cand, (list, tuple, np.ndarray)) and len(cand) > 0:
+                # Check if it contains structure tags
+                if isinstance(cand[0], str) or (isinstance(cand[0], dict) and "tag" in cand[0]):
+                    pred_structures = cand
+                # Check if it contains numeric bounding boxes
+                elif isinstance(cand[0], (list, tuple, np.ndarray)) and len(cand[0]) >= 2:
+                    if not isinstance(cand[0][0], str):
+                        pred_bboxes = cand
+
+        if not pred_structures and isinstance(raw_struct, str):
             pred_structures = raw_struct
 
         # Unwrap batch dimension if present
@@ -320,101 +370,58 @@ class TableRecognizerONNX:
         return pred_structures, pred_bboxes
 
     def _match_cells_and_build_html(
-        self,
-        pred_structures: list,
-        pred_bboxes: list,
-        ocr_tokens: list[dict],
-        img_w: int = 1,
-        img_h: int = 1,
+        self, pred_structures: list, pred_bboxes: list, ocr_tokens: list[dict]
     ) -> str:
         """Matches OCR tokens to SLANet cell coordinates and reconstructs full HTML table."""
-        # 1. Normalize and scale cell boxes to image pixel coordinates
-        raw_norm_boxes = []
+        # Standardize cell bounding boxes to [[x1, y1, x2, y2], ...]. Append None to maintain index alignment!
+        cell_boxes = []
         if pred_bboxes is not None and not isinstance(pred_bboxes, (int, float)):
             for b in pred_bboxes:
-                norm_b = self._normalize_box(b)
-                if norm_b is not None:
-                    raw_norm_boxes.append(norm_b)
+                cell_boxes.append(self._normalize_box(b))
 
-        cell_boxes = []
-        if raw_norm_boxes:
-            arr_boxes = np.array(raw_norm_boxes, dtype=np.float32)
-            max_x = float(np.max(arr_boxes[:, [0, 2]]))
-            max_y = float(np.max(arr_boxes[:, [1, 3]]))
-
-            # Detect coordinate space: normalized [0, 1] vs SLANet [0, 488] vs absolute
-            if max_x <= 1.05 and max_y <= 1.05 and (img_w > 1 or img_h > 1):
-                scale_x = float(img_w)
-                scale_y = float(img_h)
-            elif (
-                (max_x > img_w * 1.15 or max_y > img_h * 1.15)
-                or (
-                    max_x <= 490.0
-                    and max_y <= 490.0
-                    and (abs(img_w - 488) > 30 or abs(img_h - 488) > 30)
-                    and (max_x > img_w * 0.85 or max_y > img_h * 0.85)
-                )
-            ):
-                scale_x = float(img_w) / 488.0
-                scale_y = float(img_h) / 488.0
-            else:
-                scale_x = 1.0
-                scale_y = 1.0
-
-            for bx1, by1, bx2, by2 in raw_norm_boxes:
-                cell_boxes.append([bx1 * scale_x, by1 * scale_y, bx2 * scale_x, by2 * scale_y])
-
-        # 2. Map each OCR token to its best matching cell box
+        # Map each OCR token to its best overlapping or enclosing cell box
         cell_to_tokens = {i: [] for i in range(len(cell_boxes))}
         for token in ocr_tokens:
             cx, cy = token["center"]
             ox1, oy1, ox2, oy2 = token["bbox"]
             ocr_area = max(1.0, (ox2 - ox1) * (oy2 - oy1))
 
-            best_idx = None
-            best_score = -1.0
+            matched_idx = None
+            best_overlap = 0.0
 
-            for c_idx, (bx1, by1, bx2, by2) in enumerate(cell_boxes):
-                cell_w = max(1.0, bx2 - bx1)
-                cell_h = max(1.0, by2 - by1)
-                tol_x = max(8.0, cell_w * 0.25)
-                tol_y = max(8.0, cell_h * 0.25)
+            for c_idx, norm_b in enumerate(cell_boxes):
+                if norm_b is None:
+                    continue
+                    
+                bx1, by1, bx2, by2 = norm_b
+                
+                # 1. Point-in-box check (with 3px tolerance)
+                if (bx1 - 3.0) <= cx <= (bx2 + 3.0) and (by1 - 3.0) <= cy <= (by2 + 3.0):
+                    matched_idx = c_idx
+                    break
 
-                score = 0.0
-
-                # Check 1: Token center inside cell box
-                if (bx1 - tol_x) <= cx <= (bx2 + tol_x) and (by1 - tol_y) <= cy <= (by2 + tol_y):
-                    score += 10.0
-
-                # Check 2: Overlap intersection area
+                # 2. Area overlap check
                 ix1 = max(bx1, ox1)
                 iy1 = max(by1, oy1)
                 ix2 = min(bx2, ox2)
                 iy2 = min(by2, oy2)
                 if ix2 > ix1 and iy2 > iy1:
                     inter_area = (ix2 - ix1) * (iy2 - iy1)
-                    score += (inter_area / ocr_area) * 5.0
+                    ratio = inter_area / ocr_area
+                    if ratio > best_overlap:
+                        best_overlap = ratio
+                        matched_idx = c_idx
 
-                # Check 3: Distance to cell center
-                cell_cx = (bx1 + bx2) / 2.0
-                cell_cy = (by1 + by2) / 2.0
-                dist = math.hypot(cx - cell_cx, cy - cell_cy)
-                score += max(0.0, 2.0 - (dist / max(cell_w, cell_h, 30.0)))
+            if matched_idx is not None:
+                cell_to_tokens[matched_idx].append(token)
 
-                if score > best_score:
-                    best_score = score
-                    best_idx = c_idx
-
-            if best_idx is not None and best_score > 0.5:
-                cell_to_tokens[best_idx].append(token)
-
-        # 3. Sort tokens in each cell reading order (top-to-bottom, left-to-right) and join
+        # Sort tokens in each cell top-to-bottom, left-to-right and join
         cell_texts = {}
         for c_idx, tokens in cell_to_tokens.items():
             tokens.sort(key=lambda t: (t["bbox"][1], t["bbox"][0]))
             cell_texts[c_idx] = " ".join(t["text"] for t in tokens)
 
-        # 4. Assemble HTML table using pred_structures tokens
+        # Assemble HTML table using pred_structures tokens
         if isinstance(pred_structures, (list, tuple)) and pred_structures:
             html_tokens = []
             cell_idx = 0
@@ -450,9 +457,11 @@ class TableRecognizerONNX:
         else:
             html_output = ""
 
-        # 5. Fallback: if SLANet output was empty or has no cell text, build table rows directly from clustered OCR tokens
-        text_in_html = re.sub(r"<[^>]+>", "", html_output).strip() if html_output else ""
-        if (not html_output or not text_in_html or "<table" not in html_output.lower()) and ocr_tokens:
+        # Check if we successfully mapped any text into the structured table
+        has_text = any(bool(text.strip()) for text in cell_texts.values())
+
+        # Fallback: if SLANet output was empty, invalid, or we couldn't map any text, build table rows directly from clustered OCR tokens
+        if (not html_output or "<table" not in html_output.lower() or not has_text) and ocr_tokens:
             sorted_ocr = sorted(ocr_tokens, key=lambda t: t["bbox"][1])
             rows = []
             curr_row = []
@@ -471,10 +480,47 @@ class TableRecognizerONNX:
                 curr_row.sort(key=lambda item: item["bbox"][0])
                 rows.append(curr_row)
 
+            # Cluster columns based on x-coordinates
+            all_x = [t["center"][0] for row in rows for t in row]
+            all_x.sort()
+            
+            cols = []
+            if all_x:
+                curr_c = [all_x[0]]
+                for x in all_x[1:]:
+                    # 25px threshold to group items into the same column
+                    if x - (sum(curr_c) / len(curr_c)) < 25.0:
+                        curr_c.append(x)
+                    else:
+                        cols.append(sum(curr_c) / len(curr_c))
+                        curr_c = [x]
+                if curr_c:
+                    cols.append(sum(curr_c) / len(curr_c))
+
             table_rows_html = []
             for row in rows:
-                row_tds = "".join(f"<td>{t['text']}</td>" for t in row)
-                table_rows_html.append(f"<tr>{row_tds}</tr>")
+                row_tds = []
+                col_idx = 0
+                for t in row:
+                    cx = t["center"][0]
+                    # Find closest column
+                    best_c = min(range(len(cols)), key=lambda i: abs(cols[i] - cx))
+                    
+                    # Fill with empty cells if we skipped columns (e.g., indentation)
+                    while col_idx < best_c:
+                        row_tds.append("<td></td>")
+                        col_idx += 1
+                        
+                    row_tds.append(f"<td>{t['text']}</td>")
+                    # Advance col_idx to prevent overwriting if multiple tokens share a column
+                    col_idx = max(col_idx + 1, best_c + 1)
+                    
+                # Fill remaining columns
+                while col_idx < len(cols):
+                    row_tds.append("<td></td>")
+                    col_idx += 1
+                    
+                table_rows_html.append(f"<tr>{''.join(row_tds)}</tr>")
             html_output = f"<table>{''.join(table_rows_html)}</table>"
 
         return html_output
@@ -497,50 +543,34 @@ class TableRecognizerONNX:
         else:
             return {"html": "", "markdown": ""}
 
-        img_h, img_w = img_bgr.shape[:2]
+        # Scale images to a "sweet spot" resolution (longest edge ~736px)
+        # to preserve text strokes and grid lines for SLANet and OCR accuracy,
+        # while preventing OOM errors and degraded feature matching on massive crops.
+        try:
+            import cv2
+            h, w = img_bgr.shape[:2]
+            target_long_edge = 736
+            max_edge = max(h, w)
+            if max_edge > 0 and abs(max_edge - target_long_edge) > 10:
+                scale = target_long_edge / max_edge
+                new_w = int(w * scale)
+                new_h = int(h * scale)
+                interp = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
+                img_bgr = cv2.resize(img_bgr, (new_w, new_h), interpolation=interp)
+        except Exception as e:
+            logger.debug(f"Could not resize table crop: {e}")
 
         try:
             # 1. OCR text detection on table crop
-            ocr_tokens = []
-            if self.ocr_engine is not None:
-                try:
-                    ocr_out = self.ocr_engine(img_bgr)
-                    raw_boxes = self._parse_ocr_raw(ocr_out)
-                    ocr_tokens = self._extract_ocr_tokens(img_bgr, raw_ocr_res=raw_boxes)
-                except Exception as e:
-                    logger.warning(f"RapidOCR text extraction failed: {e}")
+            ocr_tokens = self._extract_ocr_tokens(img_bgr)
 
-            # 2. Try RapidTable with formatted OCR detections
-            html_str = ""
-            if self.table_engine is not None and ocr_tokens:
-                try:
-                    formatted_ocr = []
-                    for tok in ocr_tokens:
-                        bx1, by1, bx2, by2 = tok["bbox"]
-                        poly = np.array(
-                            [[bx1, by1], [bx2, by1], [bx2, by2], [bx1, by2]],
-                            dtype=np.float32,
-                        )
-                        formatted_ocr.append([poly, tok["text"], 0.99])
+            # 2. SLANet table structure inference
+            pred_structures, pred_bboxes = self._extract_slanet_structure(img_bgr)
 
-                    table_out = self.table_engine(img_bgr, formatted_ocr)
-                    if isinstance(table_out, (list, tuple)) and len(table_out) > 0:
-                        if isinstance(table_out[0], str):
-                            html_str = table_out[0]
-                    elif isinstance(table_out, str):
-                        html_str = table_out
-                except Exception as e:
-                    logger.debug(f"RapidTable direct call with OCR failed: {e}")
+            # 3. Match cells and construct HTML table
+            html_str = self._match_cells_and_build_html(pred_structures, pred_bboxes, ocr_tokens)
 
-            # 3. If RapidTable output is empty or cell text is missing, run enhanced fallback matcher
-            text_in_html = re.sub(r"<[^>]+>", "", html_str).strip() if html_str else ""
-            if not html_str or not text_in_html or "<table" not in html_str.lower():
-                pred_structures, pred_bboxes = self._extract_slanet_structure(img_bgr)
-                html_str = self._match_cells_and_build_html(
-                    pred_structures, pred_bboxes, ocr_tokens, img_w=img_w, img_h=img_h
-                )
-
-            # 4. Convert HTML table structure to Markdown
+            # 4. Convert HTML table to Markdown
             markdown_str = html_table_to_markdown(html_str)
 
             return {
@@ -990,6 +1020,25 @@ class DocLayNetONNX:
             except Exception as e:
                 logger.warning(f"Could not load TableRecognizer: {e}")
 
+        self.use_tesseract = False
+        try:
+            import pytesseract
+            pytesseract.get_tesseract_version()
+            self.use_tesseract = True
+            logger.info("Initialized Pytesseract for highly accurate text region extraction.")
+        except Exception:
+            logger.info("Pytesseract not found. Install it (`apt install tesseract-ocr` & `pip install pytesseract`) for better word spacing.")
+            pass
+
+        self.ocr_engine = None
+        if not self.use_tesseract:
+            try:
+                from rapidocr_onnxruntime import RapidOCR
+                self.ocr_engine = RapidOCR(use_cuda=use_gpu)
+                logger.info("Initialized RapidOCR engine for DocLayNet text extraction.")
+            except ImportError:
+                pass
+
         # 1. Load labels dynamically from config.json if present
         config_path = os.path.join(model_dir, "config.json")
         if os.path.exists(config_path):
@@ -1170,10 +1219,12 @@ class DocLayNetONNX:
         conf_threshold: float = None,
         iou_threshold: float = None,
         extract_tables: bool = True,
+        extract_text: bool = True,
     ) -> tuple[list[dict], tuple[int, int]]:
         """
         Detect document layout elements in an image.
         If extract_tables=True, automatically parses regions labeled 'Table' into HTML/Markdown.
+        If extract_text=True, runs OCR and maps text to text-like layout regions in reading order.
         Returns (list_of_detections, (orig_width, orig_height)).
         """
         conf_thresh = conf_threshold if conf_threshold is not None else self.conf_threshold
@@ -1257,5 +1308,187 @@ class DocLayNetONNX:
                         det_item["markdown"] = table_data["markdown"]
 
             detections.append(det_item)
+
+        # Sort detections in reading order (top-to-bottom, left-to-right)
+        # We use a 20-pixel vertical bucket to group items on the same visual line
+        detections.sort(key=lambda d: (int(d["bbox"][1] / 20.0), d["bbox"][0]))
+
+        # Extract text for text-like elements (including Pictures) if requested
+        text_labels = {"Caption", "Footnote", "Formula", "List-item", "Page-footer", "Page-header", "Picture", "Section-header", "Text", "Title"}
+        if extract_text and (self.use_tesseract or self.ocr_engine is not None):
+            needs_ocr = any(d["label"] in text_labels for d in detections)
+            
+            # Tesseract Path (Superior word spacing and formatting for Latin text)
+            if needs_ocr and self.use_tesseract:
+                import pytesseract
+                from PIL import ImageOps
+                for det in detections:
+                    if det["label"] in text_labels:
+                        bx1, by1, bx2, by2 = det["bbox"]
+                        cx1, cy1 = max(0, int(bx1)), max(0, int(by1))
+                        cx2, cy2 = min(orig_w, int(bx2)), min(orig_h, int(by2))
+                        
+                        if cx2 > cx1 and cy2 > cy1:
+                            crop = img.crop((cx1, cy1, cx2, cy2))
+                            
+                            # Invert crop if it's predominantly dark (white text on dark background)
+                            gray = np.dot(np.array(crop)[..., :3], [0.114, 0.587, 0.299])
+                            if np.sum(gray < 85) / max(1, gray.size) > 0.6:
+                                crop = ImageOps.invert(crop)
+                            
+                            # Upscale slightly for Tesseract clarity
+                            cw, ch = crop.size
+                            if max(cw, ch) < 800:
+                                crop = crop.resize((cw * 2, ch * 2), Image.Resampling.BICUBIC)
+                            
+                            try:
+                                # psm 6 assumes a single uniform block of text
+                                text = pytesseract.image_to_string(crop, config='--psm 6').strip()
+                                if text:
+                                    det["text"] = text
+                            except Exception as e:
+                                logger.debug(f"Tesseract extraction failed: {e}")
+
+            # RapidOCR Fallback Path (Portable, no system binaries)
+            elif needs_ocr and self.ocr_engine is not None:
+                try:
+                    img_bgr = np.asarray(img.convert("RGB"))[:, :, ::-1].copy()
+                    
+                    # Heuristic to skip unnecessary OCR passes based on region polarity
+                    gray = np.dot(img_bgr[..., :3], [0.114, 0.587, 0.299])
+                    run_normal = False
+                    run_negated = False
+                    
+                    for det in detections:
+                        if det["label"] in text_labels:
+                            bx1, by1, bx2, by2 = [int(v) for v in det["bbox"]]
+                            bx1, by1 = max(0, bx1), max(0, by1)
+                            bx2, by2 = min(gray.shape[1], bx2), min(gray.shape[0], by2)
+                            
+                            if bx2 > bx1 and by2 > by1:
+                                crop = gray[by1:by2, bx1:bx2]
+                                total_px = crop.size
+                                if total_px > 0:
+                                    light_pct = np.sum(crop > 170) / total_px
+                                    dark_pct = np.sum(crop < 85) / total_px
+                                    if light_pct < 0.85:
+                                        run_negated = True
+                                    if dark_pct < 0.85:
+                                        run_normal = True
+                                        
+                    # Fallback if no valid regions triggered it
+                    if not run_normal and not run_negated:
+                        run_normal = True
+
+                    # Upscale image for OCR to improve space character detection
+                    # (PaddleOCR/RapidOCR natively struggles with spaces on small text)
+                    scale_factor = 1.0
+                    h, w = img_bgr.shape[:2]
+                    if max(h, w) < 1600:
+                        scale_factor = 2.0
+                        import cv2
+                        img_bgr_ocr = cv2.resize(img_bgr, (int(w * scale_factor), int(h * scale_factor)), interpolation=cv2.INTER_CUBIC)
+                    else:
+                        img_bgr_ocr = img_bgr
+
+                    def run_ocr_pass(image_array):
+                        out = self.ocr_engine(image_array)
+                        raw = out[0] if isinstance(out, (list, tuple)) and len(out) > 0 else out
+                        toks = []
+                        if raw and isinstance(raw, list):
+                            for item in raw:
+                                if not item or len(item) < 2: continue
+                                box_pts = item[0]
+                                text_val = item[1]
+                                text_str = str(text_val[0]) if isinstance(text_val, (list, tuple)) else str(text_val)
+                                if not text_str.strip(): continue
+                                
+                                pts = np.asarray(box_pts)
+                                if pts.ndim == 2 and len(pts) >= 4:
+                                    x1, y1 = float(np.min(pts[:, 0])) / scale_factor, float(np.min(pts[:, 1])) / scale_factor
+                                    x2, y2 = float(np.max(pts[:, 0])) / scale_factor, float(np.max(pts[:, 1])) / scale_factor
+                                elif len(box_pts) == 4 and not isinstance(box_pts[0], (list, tuple, np.ndarray)):
+                                    x1, y1, x2, y2 = float(box_pts[0]) / scale_factor, float(box_pts[1]) / scale_factor, float(box_pts[2]) / scale_factor, float(box_pts[3]) / scale_factor
+                                else:
+                                    continue
+                                    
+                                # Heuristic cleanup for missing spaces (e.g. after punctuation)
+                                import re
+                                text_clean = re.sub(r'([.,:;!?])([A-Za-z])', r'\1 \2', text_str.strip())
+                                text_clean = re.sub(r'([a-z])([A-Z])', r'\1 \2', text_clean)
+                                
+                                toks.append({
+                                    "bbox": [x1, y1, x2, y2],
+                                    "center": ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
+                                    "text": text_clean,
+                                    "used": False
+                                })
+                        return toks
+
+                    normal_tokens = run_ocr_pass(img_bgr_ocr) if run_normal else []
+                    negated_tokens = run_ocr_pass(255 - img_bgr_ocr) if run_negated else []
+                    
+                    # Merge and deduplicate tokens (Spatial NMS based on Intersection over Min Area)
+                    ocr_tokens = list(normal_tokens)
+                    for n_tok in negated_tokens:
+                        is_dup = False
+                        nx1, ny1, nx2, ny2 = n_tok["bbox"]
+                        n_area = max(0, nx2 - nx1) * max(0, ny2 - ny1)
+                        for m_tok in ocr_tokens:
+                            mx1, my1, mx2, my2 = m_tok["bbox"]
+                            m_area = max(0, mx2 - mx1) * max(0, my2 - my1)
+                            
+                            ix1, iy1 = max(nx1, mx1), max(ny1, my1)
+                            ix2, iy2 = min(nx2, mx2), min(ny2, my2)
+                            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+                            
+                            # If the overlap is significant relative to the smaller bounding box
+                            if inter / (min(n_area, m_area) + 1e-9) > 0.4:
+                                is_dup = True
+                                # Favor the longer string (cleaner OCR read on high contrast)
+                                if len(n_tok["text"]) > len(m_tok["text"]) + 2:
+                                    m_tok["text"] = n_tok["text"]
+                                break
+                        
+                        if not is_dup:
+                            ocr_tokens.append(n_tok)
+                    
+                    # Map OCR tokens to detected layout regions
+                    for det in detections:
+                        if det["label"] in text_labels:
+                            bx1, by1, bx2, by2 = det["bbox"]
+                            region_tokens = []
+                            for t in ocr_tokens:
+                                if t["used"]: continue
+                                cx, cy = t["center"]
+                                if bx1 <= cx <= bx2 and by1 <= cy <= by2:
+                                    region_tokens.append(t)
+                                    t["used"] = True
+                            
+                            if region_tokens:
+                                # Sort tokens top-to-bottom, left-to-right within the region
+                                region_tokens.sort(key=lambda t: (int(t["bbox"][1] / 10.0), t["bbox"][0]))
+                                
+                                lines = []
+                                curr_line = []
+                                curr_y = None
+                                for t in region_tokens:
+                                    y_mid = t["center"][1]
+                                    if curr_y is None or abs(y_mid - curr_y) < 12.0:
+                                        curr_line.append(t["text"])
+                                        curr_y = y_mid if curr_y is None else (curr_y + y_mid) / 2.0
+                                    else:
+                                        lines.append(" ".join(curr_line))
+                                        curr_line = [t["text"]]
+                                        curr_y = y_mid
+                                if curr_line:
+                                    lines.append(" ".join(curr_line))
+
+                                if det["label"] == "Picture":
+                                    det["text"] = "\\n".join(lines)
+                                else:
+                                    det["text"] = "\n".join(lines)
+                except Exception as e:
+                    logger.warning(f"Text extraction failed during layout analysis: {e}")
 
         return detections, (orig_w, orig_h)

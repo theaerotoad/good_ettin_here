@@ -54,6 +54,7 @@ def query_layout_detection(
     conf_threshold: float = 0.25,
     iou_threshold: float = 0.45,
     extract_tables: bool = True,
+    extract_text: bool = True,
     use_multipart: bool = False,
 ) -> dict:
     """Sends an inference request to the layout detection endpoint."""
@@ -72,6 +73,7 @@ def query_layout_detection(
                 "confidence_threshold": str(conf_threshold),
                 "iou_threshold": str(iou_threshold),
                 "extract_tables": str(extract_tables).lower(),
+                "extract_text": str(extract_text).lower(),
             }
             resp = requests.post(endpoint, files=files, data=data, timeout=45)
     else:
@@ -86,6 +88,7 @@ def query_layout_detection(
             "confidence_threshold": conf_threshold,
             "iou_threshold": iou_threshold,
             "extract_tables": extract_tables,
+            "extract_text": extract_text,
         }
         resp = requests.post(endpoint, json=payload, timeout=45)
 
@@ -100,7 +103,7 @@ def query_layout_detection(
     return result
 
 
-def display_results(result: dict, image_source: str):
+def display_results(result: dict, image_source: str, show_html: bool = False):
     """Formats and prints detection results in a clean tabular view."""
     detections = result.get("detections", [])
     if not detections and "results" in result and len(result["results"]) > 0:
@@ -150,7 +153,19 @@ def display_results(result: dict, image_source: str):
         bbox = d.get("bbox", [0, 0, 0, 0])
         bbox_str = f"[{bbox[0]:.1f}, {bbox[1]:.1f}, {bbox[2]:.1f}, {bbox[3]:.1f}]"
         has_table_data = " [Table Extracted]" if (d.get("markdown") or d.get("html")) else ""
-        print(f" {idx:<3} | {label:<16} | {conf:<7} | {bbox_str:<32}{has_table_data}")
+        text_preview = d.get("text", "").replace("\n", " ")
+        has_text_data = f" [Text: {text_preview[:25]}...]" if len(text_preview) > 25 else (f" [Text: {text_preview}]" if text_preview else "")
+        print(f" {idx:<3} | {label:<16} | {conf:<7} | {bbox_str:<32}{has_table_data}{has_text_data}")
+
+    # Display extracted text blocks
+    text_regions = [d for d in detections if d.get("text")]
+    if text_regions:
+        print("\n" + "=" * 70)
+        print("  Extracted Text Content (Reading Order)")
+        print("=" * 70)
+        for d in text_regions:
+            preview = d['text'].replace('\n', ' ')
+            print(f"[{d.get('label', 'Text')}] {preview}")
 
     # Display rendered Markdown for each extracted table
     tables = [d for d in detections if d.get("label", "").lower() == "table" and (d.get("markdown") or d.get("html"))]
@@ -166,7 +181,38 @@ def display_results(result: dict, image_source: str):
                 print(t["markdown"])
             elif t.get("html"):
                 print(t["html"])
+            
+            if show_html and t.get("html"):
+                print(f"\n--- Raw HTML for Table #{t_idx} ---")
+                print(t["html"])
+                print("-" * 35)
 
+    print("\n" + "=" * 70)
+    print("  Full Document Markdown")
+    print("=" * 70)
+    
+    md_lines = []
+    filename = "image.png"
+    if not image_source.startswith("http") and not image_source.startswith("data:"):
+        filename = Path(image_source).name
+        
+    for d in detections:
+        lbl = d.get("label", "").lower()
+        if lbl == "picture":
+            text = d.get("text", "")
+            alt = f"Image with text: {text}" if text else "Image"
+            md_lines.append(f"![{alt}]({filename})")
+        elif lbl == "table":
+            if d.get("markdown"):
+                md_lines.append(d["markdown"])
+            elif d.get("html"):
+                md_lines.append(d["html"])
+        elif lbl in {"caption", "footnote", "formula", "list-item", "page-footer", "page-header", "section-header", "text", "title"}:
+            if d.get("text"):
+                md_lines.append(d["text"])
+                
+    full_md = "\n\n".join(md_lines)
+    print(full_md)
     print("=" * 70 + "\n")
 
 
@@ -206,6 +252,13 @@ def main():
         help="Disable automatic table HTML/Markdown conversion for detected tables",
     )
     parser.add_argument(
+        "--no-text",
+        action="store_false",
+        dest="extract_text",
+        default=True,
+        help="Disable automatic text extraction for text-like regions",
+    )
+    parser.add_argument(
         "--multipart",
         action="store_true",
         help="Send image via multipart/form-data upload instead of base64 JSON",
@@ -214,6 +267,11 @@ def main():
         "--skip-health",
         action="store_true",
         help="Skip pre-check health endpoint query",
+    )
+    parser.add_argument(
+        "--show-html",
+        action="store_true",
+        help="Display raw HTML output for extracted tables",
     )
 
     args = parser.parse_args()
@@ -229,10 +287,11 @@ def main():
         conf_threshold=args.conf,
         iou_threshold=args.iou,
         extract_tables=args.extract_tables,
+        extract_text=args.extract_text,
         use_multipart=args.multipart,
     )
 
-    display_results(res, args.input)
+    display_results(res, args.input, show_html=args.show_html)
 
 
 if __name__ == "__main__":
