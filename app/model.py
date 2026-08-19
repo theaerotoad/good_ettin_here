@@ -346,7 +346,15 @@ class TableRecognizerONNX:
             if max_x <= 1.05 and max_y <= 1.05 and (img_w > 1 or img_h > 1):
                 scale_x = float(img_w)
                 scale_y = float(img_h)
-            elif max_x <= 500.0 and max_y <= 500.0 and (abs(img_w - 488) > 20 or abs(img_h - 488) > 20):
+            elif (
+                (max_x > img_w * 1.15 or max_y > img_h * 1.15)
+                or (
+                    max_x <= 490.0
+                    and max_y <= 490.0
+                    and (abs(img_w - 488) > 30 or abs(img_h - 488) > 30)
+                    and (max_x > img_w * 0.85 or max_y > img_h * 0.85)
+                )
+            ):
                 scale_x = float(img_w) / 488.0
                 scale_y = float(img_h) / 488.0
             else:
@@ -363,48 +371,42 @@ class TableRecognizerONNX:
             ox1, oy1, ox2, oy2 = token["bbox"]
             ocr_area = max(1.0, (ox2 - ox1) * (oy2 - oy1))
 
-            matched_idx = None
-            best_overlap = 0.0
+            best_idx = None
+            best_score = -1.0
 
             for c_idx, (bx1, by1, bx2, by2) in enumerate(cell_boxes):
                 cell_w = max(1.0, bx2 - bx1)
                 cell_h = max(1.0, by2 - by1)
-                tol_x = max(5.0, cell_w * 0.15)
-                tol_y = max(5.0, cell_h * 0.15)
+                tol_x = max(8.0, cell_w * 0.25)
+                tol_y = max(8.0, cell_h * 0.25)
 
-                # Point-in-box check with adaptive tolerance
+                score = 0.0
+
+                # Check 1: Token center inside cell box
                 if (bx1 - tol_x) <= cx <= (bx2 + tol_x) and (by1 - tol_y) <= cy <= (by2 + tol_y):
-                    matched_idx = c_idx
-                    break
+                    score += 10.0
 
-                # Overlap ratio check
+                # Check 2: Overlap intersection area
                 ix1 = max(bx1, ox1)
                 iy1 = max(by1, oy1)
                 ix2 = min(bx2, ox2)
                 iy2 = min(by2, oy2)
                 if ix2 > ix1 and iy2 > iy1:
                     inter_area = (ix2 - ix1) * (iy2 - iy1)
-                    ratio = inter_area / ocr_area
-                    if ratio > best_overlap:
-                        best_overlap = ratio
-                        matched_idx = c_idx
+                    score += (inter_area / ocr_area) * 5.0
 
-            # Fallback: nearest cell center if within reasonable distance
-            if matched_idx is None and cell_boxes:
-                min_dist = float("inf")
-                closest_idx = None
-                for c_idx, (bx1, by1, bx2, by2) in enumerate(cell_boxes):
-                    cell_cx = (bx1 + bx2) / 2.0
-                    cell_cy = (by1 + by2) / 2.0
-                    dist = math.hypot(cx - cell_cx, cy - cell_cy)
-                    if dist < min_dist:
-                        min_dist = dist
-                        closest_idx = c_idx
-                if closest_idx is not None and min_dist < max(img_w, img_h) * 0.25:
-                    matched_idx = closest_idx
+                # Check 3: Distance to cell center
+                cell_cx = (bx1 + bx2) / 2.0
+                cell_cy = (by1 + by2) / 2.0
+                dist = math.hypot(cx - cell_cx, cy - cell_cy)
+                score += max(0.0, 2.0 - (dist / max(cell_w, cell_h, 30.0)))
 
-            if matched_idx is not None:
-                cell_to_tokens[matched_idx].append(token)
+                if score > best_score:
+                    best_score = score
+                    best_idx = c_idx
+
+            if best_idx is not None and best_score > 0.5:
+                cell_to_tokens[best_idx].append(token)
 
         # 3. Sort tokens in each cell reading order (top-to-bottom, left-to-right) and join
         cell_texts = {}
@@ -500,22 +502,43 @@ class TableRecognizerONNX:
         try:
             # 1. OCR text detection on table crop
             ocr_tokens = []
-            raw_ocr_res = []
             if self.ocr_engine is not None:
                 try:
                     ocr_out = self.ocr_engine(img_bgr)
-                    raw_ocr_res = self._parse_ocr_raw(ocr_out)
-                    ocr_tokens = self._extract_ocr_tokens(img_bgr, raw_ocr_res=raw_ocr_res)
+                    raw_boxes = self._parse_ocr_raw(ocr_out)
+                    ocr_tokens = self._extract_ocr_tokens(img_bgr, raw_ocr_res=raw_boxes)
                 except Exception as e:
                     logger.warning(f"RapidOCR text extraction failed: {e}")
 
-            # 2. Extract SLANet table structure tags and cell bounding boxes
-            pred_structures, pred_bboxes = self._extract_slanet_structure(img_bgr)
+            # 2. Try RapidTable with formatted OCR detections
+            html_str = ""
+            if self.table_engine is not None and ocr_tokens:
+                try:
+                    formatted_ocr = []
+                    for tok in ocr_tokens:
+                        bx1, by1, bx2, by2 = tok["bbox"]
+                        poly = np.array(
+                            [[bx1, by1], [bx2, by1], [bx2, by2], [bx1, by2]],
+                            dtype=np.float32,
+                        )
+                        formatted_ocr.append([poly, tok["text"], 0.99])
 
-            # 3. Match cell coordinates to OCR tokens and assemble HTML table
-            html_str = self._match_cells_and_build_html(
-                pred_structures, pred_bboxes, ocr_tokens, img_w=img_w, img_h=img_h
-            )
+                    table_out = self.table_engine(img_bgr, formatted_ocr)
+                    if isinstance(table_out, (list, tuple)) and len(table_out) > 0:
+                        if isinstance(table_out[0], str):
+                            html_str = table_out[0]
+                    elif isinstance(table_out, str):
+                        html_str = table_out
+                except Exception as e:
+                    logger.debug(f"RapidTable direct call with OCR failed: {e}")
+
+            # 3. If RapidTable output is empty or cell text is missing, run enhanced fallback matcher
+            text_in_html = re.sub(r"<[^>]+>", "", html_str).strip() if html_str else ""
+            if not html_str or not text_in_html or "<table" not in html_str.lower():
+                pred_structures, pred_bboxes = self._extract_slanet_structure(img_bgr)
+                html_str = self._match_cells_and_build_html(
+                    pred_structures, pred_bboxes, ocr_tokens, img_w=img_w, img_h=img_h
+                )
 
             # 4. Convert HTML table structure to Markdown
             markdown_str = html_table_to_markdown(html_str)
