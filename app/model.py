@@ -524,20 +524,22 @@ class TableRecognizerONNX:
         else:
             return {"html": "", "markdown": ""}
 
-        # Upscale small images to a "sweet spot" resolution (e.g., longest edge ~736px)
-        # to preserve text strokes and grid lines for SLANet and OCR accuracy.
+        # Scale images to a "sweet spot" resolution (longest edge ~736px)
+        # to preserve text strokes and grid lines for SLANet and OCR accuracy,
+        # while preventing OOM errors and degraded feature matching on massive crops.
         try:
             import cv2
             h, w = img_bgr.shape[:2]
             target_long_edge = 736
             max_edge = max(h, w)
-            if max_edge > 0 and max_edge < target_long_edge:
+            if max_edge > 0 and abs(max_edge - target_long_edge) > 10:
                 scale = target_long_edge / max_edge
                 new_w = int(w * scale)
                 new_h = int(h * scale)
-                img_bgr = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+                interp = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
+                img_bgr = cv2.resize(img_bgr, (new_w, new_h), interpolation=interp)
         except Exception as e:
-            logger.debug(f"Could not upscale table crop: {e}")
+            logger.debug(f"Could not resize table crop: {e}")
 
         try:
             # 1. OCR text detection on table crop
