@@ -971,6 +971,14 @@ class DocLayNetONNX:
             except Exception as e:
                 logger.warning(f"Could not load TableRecognizer: {e}")
 
+        self.ocr_engine = None
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            self.ocr_engine = RapidOCR(use_cuda=use_gpu)
+            logger.info("Initialized RapidOCR engine for DocLayNet text extraction.")
+        except ImportError:
+            pass
+
         # 1. Load labels dynamically from config.json if present
         config_path = os.path.join(model_dir, "config.json")
         if os.path.exists(config_path):
@@ -1151,10 +1159,12 @@ class DocLayNetONNX:
         conf_threshold: float = None,
         iou_threshold: float = None,
         extract_tables: bool = True,
+        extract_text: bool = True,
     ) -> tuple[list[dict], tuple[int, int]]:
         """
         Detect document layout elements in an image.
         If extract_tables=True, automatically parses regions labeled 'Table' into HTML/Markdown.
+        If extract_text=True, runs OCR and maps text to text-like layout regions in reading order.
         Returns (list_of_detections, (orig_width, orig_height)).
         """
         conf_thresh = conf_threshold if conf_threshold is not None else self.conf_threshold
@@ -1238,5 +1248,63 @@ class DocLayNetONNX:
                         det_item["markdown"] = table_data["markdown"]
 
             detections.append(det_item)
+
+        # Sort detections in reading order (top-to-bottom, left-to-right)
+        # We use a 20-pixel vertical bucket to group items on the same visual line
+        detections.sort(key=lambda d: (int(d["bbox"][1] / 20.0), d["bbox"][0]))
+
+        # Extract text for text-like elements if requested
+        text_labels = {"Caption", "Footnote", "Formula", "List-item", "Page-footer", "Page-header", "Section-header", "Text", "Title"}
+        if extract_text and self.ocr_engine is not None:
+            needs_ocr = any(d["label"] in text_labels for d in detections)
+            if needs_ocr:
+                try:
+                    img_bgr = np.asarray(img.convert("RGB"))[:, :, ::-1].copy()
+                    ocr_out = self.ocr_engine(img_bgr)
+                    raw_boxes = ocr_out[0] if isinstance(ocr_out, (list, tuple)) and len(ocr_out) > 0 else ocr_out
+                    
+                    ocr_tokens = []
+                    if raw_boxes and isinstance(raw_boxes, list):
+                        for item in raw_boxes:
+                            if not item or len(item) < 2: continue
+                            box_pts = item[0]
+                            text_val = item[1]
+                            text_str = str(text_val[0]) if isinstance(text_val, (list, tuple)) else str(text_val)
+                            if not text_str.strip(): continue
+                            
+                            pts = np.asarray(box_pts)
+                            if pts.ndim == 2 and len(pts) >= 4:
+                                x1, y1 = float(np.min(pts[:, 0])), float(np.min(pts[:, 1]))
+                                x2, y2 = float(np.max(pts[:, 0])), float(np.max(pts[:, 1]))
+                            elif len(box_pts) == 4 and not isinstance(box_pts[0], (list, tuple, np.ndarray)):
+                                x1, y1, x2, y2 = float(box_pts[0]), float(box_pts[1]), float(box_pts[2]), float(box_pts[3])
+                            else:
+                                continue
+                                
+                            ocr_tokens.append({
+                                "bbox": [x1, y1, x2, y2],
+                                "center": ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
+                                "text": text_str.strip(),
+                                "used": False
+                            })
+                    
+                    # Map OCR tokens to detected layout regions
+                    for det in detections:
+                        if det["label"] in text_labels:
+                            bx1, by1, bx2, by2 = det["bbox"]
+                            region_tokens = []
+                            for t in ocr_tokens:
+                                if t["used"]: continue
+                                cx, cy = t["center"]
+                                if bx1 <= cx <= bx2 and by1 <= cy <= by2:
+                                    region_tokens.append(t)
+                                    t["used"] = True
+                            
+                            if region_tokens:
+                                # Sort tokens top-to-bottom, left-to-right within the region
+                                region_tokens.sort(key=lambda t: (int(t["bbox"][1] / 10.0), t["bbox"][0]))
+                                det["text"] = " ".join(t["text"] for t in region_tokens)
+                except Exception as e:
+                    logger.warning(f"Text extraction failed during layout analysis: {e}")
 
         return detections, (orig_w, orig_h)
