@@ -192,9 +192,7 @@ def display_results(result: dict, image_source: str, show_html: bool = False):
     print("=" * 70)
     
     md_lines = []
-    filename = "image.png"
-    if not image_source.startswith("http") and not image_source.startswith("data:"):
-        filename = Path(image_source).name
+    filename = "img.png"
         
     for d in detections:
         lbl = d.get("label", "").lower()

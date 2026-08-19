@@ -1371,6 +1371,8 @@ class DocLayNetONNX:
                                 # psm 6 assumes a single uniform block of text
                                 text = pytesseract.image_to_string(crop, config='--psm 6').strip()
                                 if text:
+                                    if det["label"] == "Picture":
+                                        text = text.replace('\n', '\\n')
                                     det["text"] = text
                             except Exception as e:
                                 logger.debug(f"Tesseract extraction failed: {e}")
