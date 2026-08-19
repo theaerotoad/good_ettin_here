@@ -186,6 +186,44 @@ class TableRecognizerONNX:
 
         return ocr_tokens
 
+    @staticmethod
+    def _normalize_box(b) -> list[float]:
+        """
+        Converts varied bounding box formats (polygon points (4, 2), 8-point coordinates,
+        or 4-point coordinates) into standardized [x1, y1, x2, y2].
+        """
+        if b is None:
+            return None
+        try:
+            arr = np.asarray(b, dtype=np.float32)
+            if arr.size == 0:
+                return None
+            arr = np.squeeze(arr)
+
+            # Case A: Polygon with shape (N, 2) e.g. [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]
+            if arr.ndim == 2 and arr.shape[-1] == 2:
+                x1 = float(np.min(arr[:, 0]))
+                y1 = float(np.min(arr[:, 1]))
+                x2 = float(np.max(arr[:, 0]))
+                y2 = float(np.max(arr[:, 1]))
+                return [x1, y1, x2, y2]
+
+            # Case B: 1D array
+            if arr.ndim == 1:
+                if len(arr) == 4:
+                    return [float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])]
+                if len(arr) == 8:
+                    x1 = float(np.min(arr[0::2]))
+                    y1 = float(np.min(arr[1::2]))
+                    x2 = float(np.max(arr[0::2]))
+                    y2 = float(np.max(arr[1::2]))
+                    return [x1, y1, x2, y2]
+                if len(arr) >= 4:
+                    return [float(arr[0]), float(arr[1]), float(arr[2]), float(arr[3])]
+        except Exception:
+            pass
+        return None
+
     def _extract_slanet_structure(self, img_bgr: np.ndarray) -> tuple[list, list]:
         """Extracts HTML tags and cell bounding boxes using SLANet ONNX engine."""
         pred_structures = []
@@ -220,6 +258,14 @@ class TableRecognizerONNX:
             except Exception as e:
                 logger.warning(f"SLANet direct call failed: {e}")
 
+        # Unwrap batch dimension if present
+        if isinstance(pred_structures, list) and len(pred_structures) == 1 and isinstance(pred_structures[0], list):
+            pred_structures = pred_structures[0]
+        if isinstance(pred_bboxes, list) and len(pred_bboxes) == 1 and isinstance(pred_bboxes[0], (list, np.ndarray)):
+            pred_bboxes = pred_bboxes[0]
+        elif isinstance(pred_bboxes, np.ndarray) and pred_bboxes.ndim >= 3 and pred_bboxes.shape[0] == 1:
+            pred_bboxes = pred_bboxes[0]
+
         return pred_structures, pred_bboxes
 
     def _match_cells_and_build_html(
@@ -230,8 +276,9 @@ class TableRecognizerONNX:
         cell_boxes = []
         if pred_bboxes is not None:
             for b in pred_bboxes:
-                if isinstance(b, (list, np.ndarray)) and len(b) >= 4:
-                    cell_boxes.append([float(b[0]), float(b[1]), float(b[2]), float(b[3])])
+                norm_b = self._normalize_box(b)
+                if norm_b is not None:
+                    cell_boxes.append(norm_b)
 
         # Map each OCR token to its best overlapping or enclosing cell box
         cell_to_tokens = {i: [] for i in range(len(cell_boxes))}
@@ -274,26 +321,21 @@ class TableRecognizerONNX:
         if isinstance(pred_structures, list) and pred_structures:
             html_tokens = []
             cell_idx = 0
-            i = 0
-            while i < len(pred_structures):
-                tag = pred_structures[i]
-                if tag in ("<td></td>", "<td>"):
+            for tag in pred_structures:
+                tag_lower = tag.lower()
+                if tag_lower.startswith("<td") or tag_lower.startswith("<th"):
                     text_val = cell_texts.get(cell_idx, "")
-                    html_tokens.append(f"<td>{text_val}</td>")
                     cell_idx += 1
-                    if tag == "<td>" and (i + 1) < len(pred_structures) and pred_structures[i + 1] == "</td>":
-                        i += 1
-                elif tag in ("<th></th>", "<th>"):
-                    text_val = cell_texts.get(cell_idx, "")
-                    html_tokens.append(f"<th>{text_val}</th>")
-                    cell_idx += 1
-                    if tag == "<th>" and (i + 1) < len(pred_structures) and pred_structures[i + 1] == "</th>":
-                        i += 1
-                elif tag in ("</td>", "</th>"):
-                    pass  # Closing tags are handled inline above
+                    if tag_lower.endswith("</td>"):
+                        tag_open = tag[:-5]
+                        html_tokens.append(f"{tag_open}{text_val}</td>")
+                    elif tag_lower.endswith("</th>"):
+                        tag_open = tag[:-5]
+                        html_tokens.append(f"{tag_open}{text_val}</th>")
+                    else:
+                        html_tokens.append(f"{tag}{text_val}")
                 else:
                     html_tokens.append(tag)
-                i += 1
 
             html_output = "".join(html_tokens)
         elif isinstance(pred_structures, str) and pred_structures:
