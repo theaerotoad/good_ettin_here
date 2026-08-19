@@ -457,60 +457,62 @@ def rerank():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ettin ONNX Reranker & EmbeddingGemma Server (Flask)")
-    parser.add_argument(
+    parser = argparse.ArgumentParser(
+        description="Ettin ONNX Reranker, Embedding, & Vision Server (Flask)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # Server Configuration
+    server_group = parser.add_argument_group("Server Configuration")
+    server_group.add_argument("--host", type=str, default=config.HOST, help="Host address to bind to")
+    server_group.add_argument("--port", type=int, default=config.PORT, help="Port to bind to")
+    server_group.add_argument("--use-gpu", action="store_true", default=config.USE_GPU, help="Use CUDA GPU if available")
+
+    # Model Loading
+    model_group = parser.add_argument_group("Model Loading")
+    model_group.add_argument(
         "--model-type",
         type=str,
         default=config.MODEL_TYPE,
         choices=["ettin", "embeddinggemma", "gemma", "doclaynet", "vision", "both", "all", "auto"],
-        help="Model type to host: 'ettin', 'embeddinggemma', 'doclaynet', 'both', 'all', or 'auto'",
+        help="Model type to host",
     )
-    parser.add_argument("--model-dir", type=str, default=config.MODEL_DIR, help="Path to local directory with model files")
-    parser.add_argument("--onnx-path", type=str, default=config.ONNX_PATH, help="Direct path to model.onnx file")
-    parser.add_argument("--embedding-model-dir", type=str, default=config.EMBEDDING_MODEL_DIR, help="Path to EmbeddingGemma directory (if different from model-dir)")
-    parser.add_argument("--embedding-onnx-path", type=str, default=config.EMBEDDING_ONNX_PATH, help="Direct path to EmbeddingGemma ONNX file")
-    parser.add_argument("--doclaynet-model-dir", type=str, default=config.DOCLAYNET_MODEL_DIR, help="Path to DocLayNet directory (if different from model-dir)")
-    parser.add_argument("--doclaynet-onnx-path", type=str, default=config.DOCLAYNET_ONNX_PATH, help="Direct path to DocLayNet YOLO ONNX file")
-    parser.add_argument("--model-name", type=str, default=config.MODEL_NAME, help="Model identifier for reranker")
-    parser.add_argument("--embedding-model-name", type=str, default=config.EMBEDDING_MODEL_NAME, help="Model identifier for EmbeddingGemma")
-    parser.add_argument("--doclaynet-model-name", type=str, default=config.DOCLAYNET_MODEL_NAME, help="Model identifier for DocLayNet")
-    parser.add_argument("--conf-threshold", type=float, default=config.DOCLAYNET_CONF_THRESHOLD, help="Confidence threshold for DocLayNet object detection")
-    parser.add_argument("--iou-threshold", type=float, default=config.DOCLAYNET_IOU_THRESHOLD, help="IoU NMS threshold for DocLayNet")
-    parser.add_argument("--image-size", type=int, default=config.DOCLAYNET_IMAGE_SIZE, help="Input image dimension for YOLOv8 DocLayNet (default 640)")
-    parser.add_argument("--table-model-path", type=str, default=config.TABLE_MODEL_PATH, help="Path to RapidTable / SLANet ONNX model file")
-    parser.add_argument("--disable-table-rec", action="store_false", dest="enable_table_rec", default=config.ENABLE_TABLE_RECOGNITION, help="Disable table structure HTML/Markdown extraction")
-    parser.add_argument("--host", type=str, default=config.HOST, help="Host address to bind to")
-    parser.add_argument("--port", type=int, default=config.PORT, help="Port to bind to")
-    parser.add_argument("--max-length", type=int, default=config.MAX_LENGTH, help="Maximum token sequence length")
-    parser.add_argument("--batch-size", type=int, default=config.BATCH_SIZE, help="Batch size for inference")
-    parser.add_argument("--use-gpu", action="store_true", default=config.USE_GPU, help="Use CUDA GPU if available")
-    parser.add_argument("--normalize-scores", action="store_true", default=config.NORMALIZE_SCORES, help="Apply sigmoid score normalization for reranker")
-    parser.add_argument("--no-normalize-scores", action="store_false", dest="normalize_scores", help="Disable score normalization")
+    model_group.add_argument("--model-dir", type=str, default=config.MODEL_DIR, help="Path to local directory with default model files")
+    model_group.add_argument("--embedding-model-dir", type=str, default=config.EMBEDDING_MODEL_DIR, help="Path to EmbeddingGemma directory (if different from model-dir)")
+    model_group.add_argument("--doclaynet-model-dir", type=str, default=config.DOCLAYNET_MODEL_DIR, help="Path to DocLayNet directory (if different from model-dir)")
+
+    # Inference Settings
+    inference_group = parser.add_argument_group("Text Inference Settings")
+    inference_group.add_argument("--max-length", type=int, default=config.MAX_LENGTH, help="Maximum token sequence length")
+    inference_group.add_argument("--batch-size", type=int, default=config.BATCH_SIZE, help="Batch size for inference")
+
+    # Vision & Layout Settings
+    vision_group = parser.add_argument_group("Vision & Layout Settings (DocLayNet)")
+    vision_group.add_argument("--conf-threshold", type=float, default=config.DOCLAYNET_CONF_THRESHOLD, help="Confidence threshold for object detection")
+    vision_group.add_argument("--iou-threshold", type=float, default=config.DOCLAYNET_IOU_THRESHOLD, help="IoU NMS threshold")
+    vision_group.add_argument("--image-size", type=int, default=config.DOCLAYNET_IMAGE_SIZE, help="Input image dimension for YOLOv8")
+    vision_group.add_argument("--table-model-path", type=str, default=config.TABLE_MODEL_PATH, help="Path to RapidTable / SLANet ONNX model file")
+    vision_group.add_argument("--disable-table-rec", action="store_false", dest="enable_table_rec", default=config.ENABLE_TABLE_RECOGNITION, help="Disable table structure HTML/Markdown extraction")
 
     args = parser.parse_args()
 
     # Update global config
     config.MODEL_TYPE = args.model_type
     config.MODEL_DIR = args.model_dir
-    config.ONNX_PATH = args.onnx_path
     config.EMBEDDING_MODEL_DIR = args.embedding_model_dir or args.model_dir
-    config.EMBEDDING_ONNX_PATH = args.embedding_onnx_path or args.onnx_path
     config.DOCLAYNET_MODEL_DIR = args.doclaynet_model_dir or args.model_dir
-    config.DOCLAYNET_ONNX_PATH = args.doclaynet_onnx_path or args.onnx_path
-    config.MODEL_NAME = args.model_name
-    config.EMBEDDING_MODEL_NAME = args.embedding_model_name
-    config.DOCLAYNET_MODEL_NAME = args.doclaynet_model_name
+    
     config.DOCLAYNET_CONF_THRESHOLD = args.conf_threshold
     config.DOCLAYNET_IOU_THRESHOLD = args.iou_threshold
     config.DOCLAYNET_IMAGE_SIZE = args.image_size
     config.ENABLE_TABLE_RECOGNITION = args.enable_table_rec
     config.TABLE_MODEL_PATH = args.table_model_path
+    
     config.HOST = args.host
     config.PORT = args.port
     config.MAX_LENGTH = args.max_length
     config.BATCH_SIZE = args.batch_size
     config.USE_GPU = args.use_gpu
-    config.NORMALIZE_SCORES = args.normalize_scores
 
     global reranker_model, embedding_model, doclaynet_model
     from app.model import EttinONNXReranker, EmbeddingGemmaONNX, DocLayNetONNX
@@ -523,10 +525,8 @@ def main():
             logger.info(f"Initializing Ettin Reranker model from directory: {config.MODEL_DIR}")
             reranker_model = EttinONNXReranker(
                 model_dir=config.MODEL_DIR,
-                onnx_path=config.ONNX_PATH,
                 max_length=config.MAX_LENGTH,
                 use_gpu=config.USE_GPU,
-                normalize_scores=config.NORMALIZE_SCORES,
             )
         except Exception as e:
             if model_type == "ettin":
@@ -540,7 +540,6 @@ def main():
             logger.info(f"Initializing EmbeddingGemma model from directory: {emb_dir}")
             embedding_model = EmbeddingGemmaONNX(
                 model_dir=emb_dir,
-                onnx_path=config.EMBEDDING_ONNX_PATH,
                 max_length=config.MAX_LENGTH,
                 use_gpu=config.USE_GPU,
                 normalize_embeddings=True,
@@ -557,7 +556,6 @@ def main():
             logger.info(f"Initializing DocLayNet YOLOv8 model from directory: {doc_dir}")
             doclaynet_model = DocLayNetONNX(
                 model_dir=doc_dir,
-                onnx_path=config.DOCLAYNET_ONNX_PATH,
                 conf_threshold=config.DOCLAYNET_CONF_THRESHOLD,
                 iou_threshold=config.DOCLAYNET_IOU_THRESHOLD,
                 image_size=config.DOCLAYNET_IMAGE_SIZE,
