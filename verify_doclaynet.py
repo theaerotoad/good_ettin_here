@@ -100,7 +100,7 @@ def query_layout_detection(
     return result
 
 
-def display_results(result: dict, image_source: str):
+def display_results(result: dict, image_source: str, show_html: bool = False):
     """Formats and prints detection results in a clean tabular view."""
     detections = result.get("detections", [])
     if not detections and "results" in result and len(result["results"]) > 0:
@@ -166,6 +166,11 @@ def display_results(result: dict, image_source: str):
                 print(t["markdown"])
             elif t.get("html"):
                 print(t["html"])
+            
+            if show_html and t.get("html"):
+                print(f"\n--- Raw HTML for Table #{t_idx} ---")
+                print(t["html"])
+                print("-" * 35)
 
     print("=" * 70 + "\n")
 
@@ -215,6 +220,11 @@ def main():
         action="store_true",
         help="Skip pre-check health endpoint query",
     )
+    parser.add_argument(
+        "--show-html",
+        action="store_true",
+        help="Display raw HTML output for extracted tables",
+    )
 
     args = parser.parse_args()
 
@@ -232,7 +242,7 @@ def main():
         use_multipart=args.multipart,
     )
 
-    display_results(res, args.input)
+    display_results(res, args.input, show_html=args.show_html)
 
 
 if __name__ == "__main__":
