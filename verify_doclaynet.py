@@ -153,7 +153,7 @@ def display_results(result: dict, image_source: str, show_html: bool = False):
         bbox = d.get("bbox", [0, 0, 0, 0])
         bbox_str = f"[{bbox[0]:.1f}, {bbox[1]:.1f}, {bbox[2]:.1f}, {bbox[3]:.1f}]"
         has_table_data = " [Table Extracted]" if (d.get("markdown") or d.get("html")) else ""
-        text_preview = d.get("text", "")
+        text_preview = d.get("text", "").replace("\n", " ")
         has_text_data = f" [Text: {text_preview[:25]}...]" if len(text_preview) > 25 else (f" [Text: {text_preview}]" if text_preview else "")
         print(f" {idx:<3} | {label:<16} | {conf:<7} | {bbox_str:<32}{has_table_data}{has_text_data}")
 
@@ -164,7 +164,8 @@ def display_results(result: dict, image_source: str, show_html: bool = False):
         print("  Extracted Text Content (Reading Order)")
         print("=" * 70)
         for d in text_regions:
-            print(f"[{d.get('label', 'Text')}] {d['text']}")
+            preview = d['text'].replace('\n', ' ')
+            print(f"[{d.get('label', 'Text')}] {preview}")
 
     # Display rendered Markdown for each extracted table
     tables = [d for d in detections if d.get("label", "").lower() == "table" and (d.get("markdown") or d.get("html"))]
@@ -186,6 +187,32 @@ def display_results(result: dict, image_source: str, show_html: bool = False):
                 print(t["html"])
                 print("-" * 35)
 
+    print("\n" + "=" * 70)
+    print("  Full Document Markdown")
+    print("=" * 70)
+    
+    md_lines = []
+    filename = "image.png"
+    if not image_source.startswith("http") and not image_source.startswith("data:"):
+        filename = Path(image_source).name
+        
+    for d in detections:
+        lbl = d.get("label", "").lower()
+        if lbl == "picture":
+            text = d.get("text", "")
+            alt = f"Image with text: {text}" if text else "Image"
+            md_lines.append(f"![{alt}]({filename})")
+        elif lbl == "table":
+            if d.get("markdown"):
+                md_lines.append(d["markdown"])
+            elif d.get("html"):
+                md_lines.append(d["html"])
+        elif lbl in {"caption", "footnote", "formula", "list-item", "page-footer", "page-header", "section-header", "text", "title"}:
+            if d.get("text"):
+                md_lines.append(d["text"])
+                
+    full_md = "\n\n".join(md_lines)
+    print(full_md)
     print("=" * 70 + "\n")
 
 

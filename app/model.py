@@ -1281,8 +1281,8 @@ class DocLayNetONNX:
         # We use a 20-pixel vertical bucket to group items on the same visual line
         detections.sort(key=lambda d: (int(d["bbox"][1] / 20.0), d["bbox"][0]))
 
-        # Extract text for text-like elements if requested
-        text_labels = {"Caption", "Footnote", "Formula", "List-item", "Page-footer", "Page-header", "Section-header", "Text", "Title"}
+        # Extract text for text-like elements (including Pictures) if requested
+        text_labels = {"Caption", "Footnote", "Formula", "List-item", "Page-footer", "Page-header", "Picture", "Section-header", "Text", "Title"}
         if extract_text and self.ocr_engine is not None:
             needs_ocr = any(d["label"] in text_labels for d in detections)
             if needs_ocr:
@@ -1361,7 +1361,26 @@ class DocLayNetONNX:
                             if region_tokens:
                                 # Sort tokens top-to-bottom, left-to-right within the region
                                 region_tokens.sort(key=lambda t: (int(t["bbox"][1] / 10.0), t["bbox"][0]))
-                                det["text"] = " ".join(t["text"] for t in region_tokens)
+                                
+                                lines = []
+                                curr_line = []
+                                curr_y = None
+                                for t in region_tokens:
+                                    y_mid = t["center"][1]
+                                    if curr_y is None or abs(y_mid - curr_y) < 12.0:
+                                        curr_line.append(t["text"])
+                                        curr_y = y_mid if curr_y is None else (curr_y + y_mid) / 2.0
+                                    else:
+                                        lines.append(" ".join(curr_line))
+                                        curr_line = [t["text"]]
+                                        curr_y = y_mid
+                                if curr_line:
+                                    lines.append(" ".join(curr_line))
+
+                                if det["label"] == "Picture":
+                                    det["text"] = "\\n".join(lines)
+                                else:
+                                    det["text"] = "\n".join(lines)
                 except Exception as e:
                     logger.warning(f"Text extraction failed during layout analysis: {e}")
 
