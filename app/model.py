@@ -44,25 +44,48 @@ def html_table_to_markdown(html_content: str) -> str:
             if not rows:
                 continue
 
-            grid = []
-            max_cols = 0
+            grid_dict = {}
+            r = 0
             for row in rows:
+                c = 0
                 cells = row.find_all(["th", "td"])
-                row_data = []
                 for cell in cells:
+                    # Skip cells that are already filled by a previous rowspan/colspan
+                    while (r, c) in grid_dict:
+                        c += 1
+                    
                     text = cell.get_text(separator=" ", strip=True)
                     text = text.replace("|", "\\|").replace("\n", " ").strip()
-                    row_data.append(text)
-                if row_data:
-                    grid.append(row_data)
-                    max_cols = max(max_cols, len(row_data))
+                    
+                    try:
+                        colspan = int(cell.get("colspan", 1))
+                    except (ValueError, TypeError):
+                        colspan = 1
+                        
+                    try:
+                        rowspan = int(cell.get("rowspan", 1))
+                    except (ValueError, TypeError):
+                        rowspan = 1
+                        
+                    # Populate the grid coordinates covered by this cell
+                    for i in range(rowspan):
+                        for j in range(colspan):
+                            grid_dict[(r + i, c + j)] = text
+                    
+                    c += colspan
+                r += 1
 
-            if not grid or max_cols == 0:
+            if not grid_dict:
                 continue
 
-            for row in grid:
-                while len(row) < max_cols:
-                    row.append("")
+            max_r = max(k[0] for k in grid_dict.keys())
+            max_c = max(k[1] for k in grid_dict.keys())
+            max_cols = max_c + 1
+
+            grid = []
+            for i in range(max_r + 1):
+                row_data = [grid_dict.get((i, j), "") for j in range(max_cols)]
+                grid.append(row_data)
 
             col_widths = [3] * max_cols
             for row in grid:
