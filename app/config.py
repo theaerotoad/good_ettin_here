@@ -17,6 +17,8 @@ DOCLAYNET_MODEL_NAME = os.getenv("DOCLAYNET_MODEL_NAME", "yolov8n-doclaynet")
 DOCLAYNET_CONF_THRESHOLD = float(os.getenv("DOCLAYNET_CONF_THRESHOLD", "0.25"))
 DOCLAYNET_IOU_THRESHOLD = float(os.getenv("DOCLAYNET_IOU_THRESHOLD", "0.45"))
 DOCLAYNET_IMAGE_SIZE = int(os.getenv("DOCLAYNET_IMAGE_SIZE", "640"))
+ENABLE_TABLE_RECOGNITION = os.getenv("ENABLE_TABLE_RECOGNITION", "true").lower() in ("true", "1", "yes")
+TABLE_MODEL_PATH = os.getenv("TABLE_MODEL_PATH", None)
 
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))

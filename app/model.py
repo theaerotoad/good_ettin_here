@@ -27,6 +27,159 @@ except ImportError:
         return 0.5 * x * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (x + 0.044715 * np.power(x, 3))))
 
 
+def html_table_to_markdown(html_content: str) -> str:
+    """Converts HTML table markup into GitHub-Flavored Markdown (GFM) format."""
+    if not html_content or "<table" not in html_content.lower():
+        return ""
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html_content, "html.parser")
+        tables = soup.find_all("table")
+        if not tables:
+            return ""
+
+        md_tables = []
+        for table in tables:
+            rows = table.find_all("tr")
+            if not rows:
+                continue
+
+            grid = []
+            max_cols = 0
+            for row in rows:
+                cells = row.find_all(["th", "td"])
+                row_data = []
+                for cell in cells:
+                    text = cell.get_text(separator=" ", strip=True)
+                    text = text.replace("|", "\\|").replace("\n", " ").strip()
+                    row_data.append(text)
+                if row_data:
+                    grid.append(row_data)
+                    max_cols = max(max_cols, len(row_data))
+
+            if not grid or max_cols == 0:
+                continue
+
+            for row in grid:
+                while len(row) < max_cols:
+                    row.append("")
+
+            col_widths = [3] * max_cols
+            for row in grid:
+                for col_idx, cell in enumerate(row):
+                    col_widths[col_idx] = max(col_widths[col_idx], len(cell))
+
+            lines = []
+            header = grid[0]
+            lines.append("| " + " | ".join(header[i].ljust(col_widths[i]) for i in range(max_cols)) + " |")
+            lines.append("| " + " | ".join("-" * col_widths[i] for i in range(max_cols)) + " |")
+            for row in grid[1:]:
+                lines.append("| " + " | ".join(row[i].ljust(col_widths[i]) for i in range(max_cols)) + " |")
+
+            md_tables.append("\n".join(lines))
+
+        return "\n\n".join(md_tables)
+    except Exception as e:
+        logger.warning(f"Failed to convert HTML table to Markdown: {e}")
+        return ""
+
+
+class TableRecognizerONNX:
+    """
+    ONNX-based Table Structure Recognizer using RapidTable (SLANet) and RapidOCR.
+    Produces HTML and Markdown representations for cropped table image regions.
+    """
+
+    def __init__(self, table_model_path: str = None, use_gpu: bool = False):
+        self.table_engine = None
+        self.ocr_engine = None
+        self._init_engines(table_model_path, use_gpu)
+
+    def _init_engines(self, table_model_path: str = None, use_gpu: bool = False):
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            from rapid_table import RapidTable
+        except ImportError:
+            logger.warning(
+                "rapid-table or rapidocr-onnxruntime not installed. "
+                "Table structure recognition disabled. Install via: "
+                "pip install rapid-table rapidocr-onnxruntime beautifulsoup4"
+            )
+            return
+
+        try:
+            ocr_params = {}
+            if use_gpu:
+                ocr_params["use_cuda"] = True
+            self.ocr_engine = RapidOCR(**ocr_params)
+        except Exception as e:
+            logger.warning(f"Could not initialize RapidOCR: {e}")
+            self.ocr_engine = None
+
+        try:
+            table_params = {}
+            if table_model_path and os.path.exists(table_model_path):
+                table_params["model_path"] = table_model_path
+            if use_gpu:
+                table_params["use_cuda"] = True
+            self.table_engine = RapidTable(**table_params)
+            logger.info("Initialized RapidTable SLANet engine for table structure extraction.")
+        except Exception as e:
+            logger.warning(f"Could not initialize RapidTable: {e}")
+            self.table_engine = None
+
+    def extract(self, image_input) -> dict:
+        if self.table_engine is None:
+            return {"html": "", "markdown": ""}
+
+        # Standardize input to OpenCV BGR numpy array
+        if isinstance(image_input, Image.Image):
+            rgb_arr = np.asarray(image_input.convert("RGB"))
+            img_bgr = rgb_arr[:, :, ::-1]
+        elif isinstance(image_input, np.ndarray):
+            if image_input.ndim == 2:
+                img_bgr = np.stack([image_input] * 3, axis=-1)
+            elif image_input.shape[2] == 3:
+                img_bgr = image_input
+            else:
+                img_bgr = image_input[:, :, :3]
+        else:
+            return {"html": "", "markdown": ""}
+
+        # 1. OCR text detection & recognition
+        ocr_result = None
+        if self.ocr_engine is not None:
+            try:
+                ocr_result, _ = self.ocr_engine(img_bgr)
+            except Exception as e:
+                logger.warning(f"OCR step failed on table crop: {e}")
+
+        # 2. Table structure recognition
+        try:
+            if ocr_result is not None:
+                table_out = self.table_engine(img_bgr, ocr_result)
+            else:
+                table_out = self.table_engine(img_bgr)
+
+            if isinstance(table_out, tuple):
+                html_str = table_out[0]
+            elif hasattr(table_out, "pred_html"):
+                html_str = table_out.pred_html
+            elif isinstance(table_out, str):
+                html_str = table_out
+            else:
+                html_str = str(table_out)
+
+            markdown_str = html_table_to_markdown(html_str)
+            return {
+                "html": html_str or "",
+                "markdown": markdown_str or "",
+            }
+        except Exception as e:
+            logger.warning(f"RapidTable extraction failed: {e}")
+            return {"html": "", "markdown": ""}
+
+
 def _get_tensor(tensor_dict: dict, *candidate_keys):
     """Safely retrieves a tensor matching candidate keys from a safetensors dictionary."""
     if not tensor_dict:
@@ -446,12 +599,24 @@ class DocLayNetONNX:
         iou_threshold: float = 0.45,
         image_size: int = 640,
         use_gpu: bool = False,
+        enable_table_rec: bool = True,
+        table_model_path: str = None,
     ):
         self.model_dir = model_dir
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
         self.image_size = image_size
         self.labels = self.DOCLAYNET_LABELS
+        self.table_recognizer = None
+
+        if enable_table_rec:
+            try:
+                self.table_recognizer = TableRecognizerONNX(
+                    table_model_path=table_model_path,
+                    use_gpu=use_gpu,
+                )
+            except Exception as e:
+                logger.warning(f"Could not load TableRecognizer: {e}")
 
         # 1. Load labels dynamically from config.json if present
         config_path = os.path.join(model_dir, "config.json")
@@ -632,9 +797,11 @@ class DocLayNetONNX:
         image_input,
         conf_threshold: float = None,
         iou_threshold: float = None,
+        extract_tables: bool = True,
     ) -> tuple[list[dict], tuple[int, int]]:
         """
         Detect document layout elements in an image.
+        If extract_tables=True, automatically parses regions labeled 'Table' into HTML/Markdown.
         Returns (list_of_detections, (orig_width, orig_height)).
         """
         conf_thresh = conf_threshold if conf_threshold is not None else self.conf_threshold
@@ -690,7 +857,7 @@ class DocLayNetONNX:
         for idx in keep_indices:
             cid = int(valid_class_ids[idx])
             label_name = self.labels[cid] if cid < len(self.labels) else f"class_{cid}"
-            detections.append({
+            det_item = {
                 "bbox": [
                     round(float(boxes_xyxy[idx, 0]), 2),
                     round(float(boxes_xyxy[idx, 1]), 2),
@@ -700,6 +867,23 @@ class DocLayNetONNX:
                 "confidence": round(float(valid_scores[idx]), 4),
                 "class_id": cid,
                 "label": label_name,
-            })
+            }
+
+            # If the detected region is a Table and table extraction is active, convert to HTML/Markdown
+            if extract_tables and self.table_recognizer is not None and label_name.lower() == "table":
+                bx1, by1, bx2, by2 = boxes_xyxy[idx]
+                cx1 = max(0, int(bx1) - 4)
+                cy1 = max(0, int(by1) - 4)
+                cx2 = min(orig_w, int(bx2) + 4)
+                cy2 = min(orig_h, int(by2) + 4)
+                if cx2 > cx1 and cy2 > cy1:
+                    crop = img.crop((cx1, cy1, cx2, cy2))
+                    table_data = self.table_recognizer.extract(crop)
+                    if table_data.get("html"):
+                        det_item["html"] = table_data["html"]
+                    if table_data.get("markdown"):
+                        det_item["markdown"] = table_data["markdown"]
+
+            detections.append(det_item)
 
         return detections, (orig_w, orig_h)

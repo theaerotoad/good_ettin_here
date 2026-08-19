@@ -53,6 +53,7 @@ def query_layout_detection(
     image_input: str,
     conf_threshold: float = 0.25,
     iou_threshold: float = 0.45,
+    extract_tables: bool = True,
     use_multipart: bool = False,
 ) -> dict:
     """Sends an inference request to the layout detection endpoint."""
@@ -70,8 +71,9 @@ def query_layout_detection(
             data = {
                 "confidence_threshold": str(conf_threshold),
                 "iou_threshold": str(iou_threshold),
+                "extract_tables": str(extract_tables).lower(),
             }
-            resp = requests.post(endpoint, files=files, data=data, timeout=30)
+            resp = requests.post(endpoint, files=files, data=data, timeout=45)
     else:
         # Check if input is a URL or a local file
         if image_input.startswith("http://") or image_input.startswith("https://") or image_input.startswith("data:image"):
@@ -83,8 +85,9 @@ def query_layout_detection(
             "image": payload_img,
             "confidence_threshold": conf_threshold,
             "iou_threshold": iou_threshold,
+            "extract_tables": extract_tables,
         }
-        resp = requests.post(endpoint, json=payload, timeout=30)
+        resp = requests.post(endpoint, json=payload, timeout=45)
 
     elapsed_ms = (time.time() - start_time) * 1000
 
@@ -137,7 +140,23 @@ def display_results(result: dict, image_source: str):
         conf = f"{d.get('confidence', 0.0) * 100:.1f}%"
         bbox = d.get("bbox", [0, 0, 0, 0])
         bbox_str = f"[{bbox[0]:.1f}, {bbox[1]:.1f}, {bbox[2]:.1f}, {bbox[3]:.1f}]"
-        print(f" {idx:<3} | {label:<16} | {conf:<7} | {bbox_str:<32}")
+        has_table_data = " [Table Extracted]" if (d.get("markdown") or d.get("html")) else ""
+        print(f" {idx:<3} | {label:<16} | {conf:<7} | {bbox_str:<32}{has_table_data}")
+
+    # Display rendered Markdown for each extracted table
+    tables = [d for d in detections if d.get("label", "").lower() == "table" and (d.get("markdown") or d.get("html"))]
+    if tables:
+        print("\n" + "=" * 70)
+        print("  Extracted Table Structures (Markdown)")
+        print("=" * 70)
+        for t_idx, t in enumerate(tables, start=1):
+            conf = f"{t.get('confidence', 0.0) * 100:.1f}%"
+            bbox = t.get("bbox", [])
+            print(f"\n[Table #{t_idx}] Confidence: {conf} | Bounding Box: {bbox}")
+            if t.get("markdown"):
+                print(t["markdown"])
+            elif t.get("html"):
+                print(t["html"])
 
     print("=" * 70 + "\n")
 
@@ -171,6 +190,13 @@ def main():
         help="IoU threshold for Non-Maximum Suppression (default: 0.45)",
     )
     parser.add_argument(
+        "--no-tables",
+        action="store_false",
+        dest="extract_tables",
+        default=True,
+        help="Disable automatic table HTML/Markdown conversion for detected tables",
+    )
+    parser.add_argument(
         "--multipart",
         action="store_true",
         help="Send image via multipart/form-data upload instead of base64 JSON",
@@ -193,6 +219,7 @@ def main():
         image_input=args.input,
         conf_threshold=args.conf,
         iou_threshold=args.iou,
+        extract_tables=args.extract_tables,
         use_multipart=args.multipart,
     )
 

@@ -234,6 +234,7 @@ def detect_layout():
 
     conf_thresh = None
     iou_thresh = None
+    extract_tables = config.ENABLE_TABLE_RECOGNITION
     images_to_process = []
 
     # Check for multipart/form-data upload or JSON payload
@@ -242,6 +243,8 @@ def detect_layout():
             conf_thresh = float(request.form.get("confidence_threshold"))
         if "iou_threshold" in request.form:
             iou_thresh = float(request.form.get("iou_threshold"))
+        if "extract_tables" in request.form:
+            extract_tables = request.form.get("extract_tables").lower() in ("true", "1", "yes")
 
         for key in ("file", "image"):
             if key in request.files:
@@ -256,6 +259,8 @@ def detect_layout():
             conf_thresh = float(payload["confidence_threshold"])
         if "iou_threshold" in payload:
             iou_thresh = float(payload["iou_threshold"])
+        if "extract_tables" in payload:
+            extract_tables = bool(payload["extract_tables"])
 
         if "image" in payload:
             images_to_process.append(payload["image"])
@@ -283,6 +288,7 @@ def detect_layout():
                 img_input,
                 conf_threshold=conf_thresh,
                 iou_threshold=iou_thresh,
+                extract_tables=extract_tables,
             )
             results.append({
                 "image_index": idx,
@@ -309,6 +315,81 @@ def detect_layout():
 
         return jsonify(response_payload)
     except Exception as e:
+        logger.exception("Error running DocLayNet layout detection")
+        return jsonify({
+            "error": {
+                "message": str(e),
+                "type": "processing_error",
+            }
+        }), 500
+
+
+@app.route("/v1/vision/table", methods=["POST", "OPTIONS"])
+@app.route("/v1/table", methods=["POST", "OPTIONS"])
+def extract_table():
+    if request.method == "OPTIONS":
+        return "", 200
+
+    if doclaynet_model is None or doclaynet_model.table_recognizer is None:
+        return jsonify({
+            "error": {
+                "message": "Table structure recognition model is not initialized or dependencies missing.",
+                "type": "server_error",
+            }
+        }), 503
+
+    images_to_process = []
+    if request.content_type and "multipart/form-data" in request.content_type:
+        for key in ("file", "image"):
+            if key in request.files:
+                images_to_process.append(request.files[key].read())
+        if not images_to_process and request.files:
+            for file_storage in request.files.values():
+                images_to_process.append(file_storage.read())
+    else:
+        payload = request.get_json(force=True, silent=True) or {}
+        if "image" in payload:
+            images_to_process.append(payload["image"])
+        elif "input" in payload:
+            inp = payload["input"]
+            if isinstance(inp, list):
+                images_to_process.extend(inp)
+            else:
+                images_to_process.append(inp)
+
+    if not images_to_process:
+        return jsonify({
+            "error": {
+                "message": "No table image provided. Pass 'image' or upload a file via multipart form.",
+                "type": "invalid_request_error",
+            }
+        }), 400
+
+    try:
+        results = []
+        for img_input in images_to_process:
+            loaded_img = doclaynet_model._load_image(img_input)
+            table_data = doclaynet_model.table_recognizer.extract(loaded_img)
+            results.append(table_data)
+
+        if len(results) == 1:
+            return jsonify({
+                "model": "rapid-table-slanet",
+                "html": results[0]["html"],
+                "markdown": results[0]["markdown"],
+            })
+        return jsonify({
+            "model": "rapid-table-slanet",
+            "results": results,
+        })
+    except Exception as e:
+        logger.exception("Error running table extraction")
+        return jsonify({
+            "error": {
+                "message": str(e),
+                "type": "processing_error",
+            }
+        }), 500
         logger.exception("Error running DocLayNet layout detection")
         return jsonify({
             "error": {
@@ -403,6 +484,8 @@ def main():
     parser.add_argument("--conf-threshold", type=float, default=config.DOCLAYNET_CONF_THRESHOLD, help="Confidence threshold for DocLayNet object detection")
     parser.add_argument("--iou-threshold", type=float, default=config.DOCLAYNET_IOU_THRESHOLD, help="IoU NMS threshold for DocLayNet")
     parser.add_argument("--image-size", type=int, default=config.DOCLAYNET_IMAGE_SIZE, help="Input image dimension for YOLOv8 DocLayNet (default 640)")
+    parser.add_argument("--table-model-path", type=str, default=config.TABLE_MODEL_PATH, help="Path to RapidTable / SLANet ONNX model file")
+    parser.add_argument("--disable-table-rec", action="store_false", dest="enable_table_rec", default=config.ENABLE_TABLE_RECOGNITION, help="Disable table structure HTML/Markdown extraction")
     parser.add_argument("--host", type=str, default=config.HOST, help="Host address to bind to")
     parser.add_argument("--port", type=int, default=config.PORT, help="Port to bind to")
     parser.add_argument("--max-length", type=int, default=config.MAX_LENGTH, help="Maximum token sequence length")
@@ -427,6 +510,8 @@ def main():
     config.DOCLAYNET_CONF_THRESHOLD = args.conf_threshold
     config.DOCLAYNET_IOU_THRESHOLD = args.iou_threshold
     config.DOCLAYNET_IMAGE_SIZE = args.image_size
+    config.ENABLE_TABLE_RECOGNITION = args.enable_table_rec
+    config.TABLE_MODEL_PATH = args.table_model_path
     config.HOST = args.host
     config.PORT = args.port
     config.MAX_LENGTH = args.max_length
@@ -484,6 +569,8 @@ def main():
                 iou_threshold=config.DOCLAYNET_IOU_THRESHOLD,
                 image_size=config.DOCLAYNET_IMAGE_SIZE,
                 use_gpu=config.USE_GPU,
+                enable_table_rec=config.ENABLE_TABLE_RECOGNITION,
+                table_model_path=config.TABLE_MODEL_PATH,
             )
         except Exception as e:
             if model_type in ("doclaynet", "vision"):
