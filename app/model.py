@@ -123,10 +123,50 @@ class TableRecognizerONNX:
             if use_gpu:
                 table_params["use_cuda"] = True
             self.table_engine = RapidTable(**table_params)
+
+            # Inject the initialized OCR engine into RapidTable if it lacks one
+            if hasattr(self.table_engine, "ocr_engine") and self.table_engine.ocr_engine is None and self.ocr_engine is not None:
+                self.table_engine.ocr_engine = self.ocr_engine
+
             logger.info("Initialized RapidTable SLANet engine for table structure extraction.")
         except Exception as e:
             logger.warning(f"Could not initialize RapidTable: {e}")
             self.table_engine = None
+
+    def _format_ocr_result(self, ocr_result):
+        """
+        Formats RapidOCR output [ [box, text, score], ... ] into the structure expected by
+        RapidTable's matcher: [ [box, (text, float_score)], ... ]
+        """
+        if not ocr_result:
+            return []
+
+        formatted = []
+        for item in ocr_result:
+            if not item:
+                continue
+            if len(item) == 3:
+                box, text, score = item
+                try:
+                    score_f = float(score)
+                except (ValueError, TypeError):
+                    score_f = 1.0
+                formatted.append([box, (str(text), score_f)])
+            elif len(item) == 2:
+                box, text_score = item
+                if isinstance(text_score, (list, tuple)) and len(text_score) >= 2:
+                    try:
+                        score_f = float(text_score[1])
+                    except (ValueError, TypeError):
+                        score_f = 1.0
+                    formatted.append([box, (str(text_score[0]), score_f)])
+                elif isinstance(text_score, (list, tuple)) and len(text_score) == 1:
+                    formatted.append([box, (str(text_score[0]), 1.0)])
+                else:
+                    formatted.append([box, (str(text_score), 1.0)])
+            elif len(item) == 1:
+                formatted.append([item[0], ("", 1.0)])
+        return formatted
 
     def extract(self, image_input) -> dict:
         if self.table_engine is None:
@@ -150,18 +190,37 @@ class TableRecognizerONNX:
         ocr_result = None
         if self.ocr_engine is not None:
             try:
-                ocr_result, _ = self.ocr_engine(img_bgr)
+                ocr_out = self.ocr_engine(img_bgr)
+                if isinstance(ocr_out, (list, tuple)):
+                    ocr_result = ocr_out[0]
+                else:
+                    ocr_result = ocr_out
             except Exception as e:
                 logger.warning(f"OCR step failed on table crop: {e}")
 
-        # 2. Table structure recognition
-        try:
-            if ocr_result is not None:
-                table_out = self.table_engine(img_bgr, ocr_result)
-            else:
-                table_out = self.table_engine(img_bgr)
+        formatted_ocr = self._format_ocr_result(ocr_result)
 
-            if isinstance(table_out, tuple):
+        # 2. Table structure recognition with multi-tier fallback
+        table_out = None
+        if formatted_ocr:
+            try:
+                table_out = self.table_engine(img_bgr, formatted_ocr)
+            except Exception as e1:
+                logger.warning(f"RapidTable with formatted OCR failed: {e1}. Retrying with raw OCR...")
+                try:
+                    table_out = self.table_engine(img_bgr, ocr_result)
+                except Exception as e2:
+                    logger.warning(f"RapidTable with raw OCR failed: {e2}. Retrying structure-only...")
+
+        if table_out is None:
+            try:
+                table_out = self.table_engine(img_bgr)
+            except Exception as e3:
+                logger.warning(f"RapidTable structure extraction without OCR failed: {e3}")
+                return {"html": "", "markdown": ""}
+
+        try:
+            if isinstance(table_out, (tuple, list)):
                 html_str = table_out[0]
             elif hasattr(table_out, "pred_html"):
                 html_str = table_out.pred_html
@@ -176,7 +235,7 @@ class TableRecognizerONNX:
                 "markdown": markdown_str or "",
             }
         except Exception as e:
-            logger.warning(f"RapidTable extraction failed: {e}")
+            logger.warning(f"Error formatting table output: {e}")
             return {"html": "", "markdown": ""}
 
 

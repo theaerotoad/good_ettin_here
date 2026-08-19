@@ -103,7 +103,16 @@ def query_layout_detection(
 def display_results(result: dict, image_source: str):
     """Formats and prints detection results in a clean tabular view."""
     detections = result.get("detections", [])
+    if not detections and "results" in result and len(result["results"]) > 0:
+        detections = result["results"][0].get("detections", [])
+
     img_size = result.get("image_size", {})
+    if not img_size and "results" in result and len(result["results"]) > 0:
+        img_size = {
+            "width": result["results"][0].get("width", "N/A"),
+            "height": result["results"][0].get("height", "N/A"),
+        }
+
     latency = result.get("_client_latency_ms", 0.0)
 
     print("\n" + "=" * 70)
