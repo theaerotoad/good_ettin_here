@@ -1020,13 +1020,24 @@ class DocLayNetONNX:
             except Exception as e:
                 logger.warning(f"Could not load TableRecognizer: {e}")
 
-        self.ocr_engine = None
+        self.use_tesseract = False
         try:
-            from rapidocr_onnxruntime import RapidOCR
-            self.ocr_engine = RapidOCR(use_cuda=use_gpu)
-            logger.info("Initialized RapidOCR engine for DocLayNet text extraction.")
-        except ImportError:
+            import pytesseract
+            pytesseract.get_tesseract_version()
+            self.use_tesseract = True
+            logger.info("Initialized Pytesseract for highly accurate text region extraction.")
+        except Exception:
+            logger.info("Pytesseract not found. Install it (`apt install tesseract-ocr` & `pip install pytesseract`) for better word spacing.")
             pass
+
+        self.ocr_engine = None
+        if not self.use_tesseract:
+            try:
+                from rapidocr_onnxruntime import RapidOCR
+                self.ocr_engine = RapidOCR(use_cuda=use_gpu)
+                logger.info("Initialized RapidOCR engine for DocLayNet text extraction.")
+            except ImportError:
+                pass
 
         # 1. Load labels dynamically from config.json if present
         config_path = os.path.join(model_dir, "config.json")
@@ -1304,9 +1315,42 @@ class DocLayNetONNX:
 
         # Extract text for text-like elements (including Pictures) if requested
         text_labels = {"Caption", "Footnote", "Formula", "List-item", "Page-footer", "Page-header", "Picture", "Section-header", "Text", "Title"}
-        if extract_text and self.ocr_engine is not None:
+        if extract_text and (self.use_tesseract or self.ocr_engine is not None):
             needs_ocr = any(d["label"] in text_labels for d in detections)
-            if needs_ocr:
+            
+            # Tesseract Path (Superior word spacing and formatting for Latin text)
+            if needs_ocr and self.use_tesseract:
+                import pytesseract
+                from PIL import ImageOps
+                for det in detections:
+                    if det["label"] in text_labels:
+                        bx1, by1, bx2, by2 = det["bbox"]
+                        cx1, cy1 = max(0, int(bx1)), max(0, int(by1))
+                        cx2, cy2 = min(orig_w, int(bx2)), min(orig_h, int(by2))
+                        
+                        if cx2 > cx1 and cy2 > cy1:
+                            crop = img.crop((cx1, cy1, cx2, cy2))
+                            
+                            # Invert crop if it's predominantly dark (white text on dark background)
+                            gray = np.dot(np.array(crop)[..., :3], [0.114, 0.587, 0.299])
+                            if np.sum(gray < 85) / max(1, gray.size) > 0.6:
+                                crop = ImageOps.invert(crop)
+                            
+                            # Upscale slightly for Tesseract clarity
+                            cw, ch = crop.size
+                            if max(cw, ch) < 800:
+                                crop = crop.resize((cw * 2, ch * 2), Image.Resampling.BICUBIC)
+                            
+                            try:
+                                # psm 6 assumes a single uniform block of text
+                                text = pytesseract.image_to_string(crop, config='--psm 6').strip()
+                                if text:
+                                    det["text"] = text
+                            except Exception as e:
+                                logger.debug(f"Tesseract extraction failed: {e}")
+
+            # RapidOCR Fallback Path (Portable, no system binaries)
+            elif needs_ocr and self.ocr_engine is not None:
                 try:
                     img_bgr = np.asarray(img.convert("RGB"))[:, :, ::-1].copy()
                     
