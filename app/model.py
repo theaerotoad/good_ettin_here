@@ -182,8 +182,8 @@ class TableRecognizerONNX:
                     box_pts = item[0]
                     text_val = item[1]
                     text_str = str(text_val[0]) if isinstance(text_val, (list, tuple)) else str(text_val)
-
-                    if not text_str.strip():
+                    text_str = text_str.strip()
+                    if not text_str:
                         continue
 
                     pts = np.asarray(box_pts)
@@ -197,10 +197,15 @@ class TableRecognizerONNX:
                     else:
                         continue
 
+                    # Heuristic cleanup for missing spaces
+                    import re
+                    text_clean = re.sub(r'([.,:;!?])([A-Za-z])', r'\1 \2', text_str)
+                    text_clean = re.sub(r'([a-z])([A-Z])', r'\1 \2', text_clean)
+
                     toks.append({
                         "bbox": [x1, y1, x2, y2],
                         "center": ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
-                        "text": text_str.strip(),
+                        "text": text_clean,
                     })
             except Exception as e:
                 logger.debug(f"OCR pass failed: {e}")
@@ -1331,6 +1336,17 @@ class DocLayNetONNX:
                     if not run_normal and not run_negated:
                         run_normal = True
 
+                    # Upscale image for OCR to improve space character detection
+                    # (PaddleOCR/RapidOCR natively struggles with spaces on small text)
+                    scale_factor = 1.0
+                    h, w = img_bgr.shape[:2]
+                    if max(h, w) < 1600:
+                        scale_factor = 2.0
+                        import cv2
+                        img_bgr_ocr = cv2.resize(img_bgr, (int(w * scale_factor), int(h * scale_factor)), interpolation=cv2.INTER_CUBIC)
+                    else:
+                        img_bgr_ocr = img_bgr
+
                     def run_ocr_pass(image_array):
                         out = self.ocr_engine(image_array)
                         raw = out[0] if isinstance(out, (list, tuple)) and len(out) > 0 else out
@@ -1345,23 +1361,28 @@ class DocLayNetONNX:
                                 
                                 pts = np.asarray(box_pts)
                                 if pts.ndim == 2 and len(pts) >= 4:
-                                    x1, y1 = float(np.min(pts[:, 0])), float(np.min(pts[:, 1]))
-                                    x2, y2 = float(np.max(pts[:, 0])), float(np.max(pts[:, 1]))
+                                    x1, y1 = float(np.min(pts[:, 0])) / scale_factor, float(np.min(pts[:, 1])) / scale_factor
+                                    x2, y2 = float(np.max(pts[:, 0])) / scale_factor, float(np.max(pts[:, 1])) / scale_factor
                                 elif len(box_pts) == 4 and not isinstance(box_pts[0], (list, tuple, np.ndarray)):
-                                    x1, y1, x2, y2 = float(box_pts[0]), float(box_pts[1]), float(box_pts[2]), float(box_pts[3])
+                                    x1, y1, x2, y2 = float(box_pts[0]) / scale_factor, float(box_pts[1]) / scale_factor, float(box_pts[2]) / scale_factor, float(box_pts[3]) / scale_factor
                                 else:
                                     continue
                                     
+                                # Heuristic cleanup for missing spaces (e.g. after punctuation)
+                                import re
+                                text_clean = re.sub(r'([.,:;!?])([A-Za-z])', r'\1 \2', text_str.strip())
+                                text_clean = re.sub(r'([a-z])([A-Z])', r'\1 \2', text_clean)
+                                
                                 toks.append({
                                     "bbox": [x1, y1, x2, y2],
                                     "center": ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
-                                    "text": text_str.strip(),
+                                    "text": text_clean,
                                     "used": False
                                 })
                         return toks
 
-                    normal_tokens = run_ocr_pass(img_bgr) if run_normal else []
-                    negated_tokens = run_ocr_pass(255 - img_bgr) if run_negated else []
+                    normal_tokens = run_ocr_pass(img_bgr_ocr) if run_normal else []
+                    negated_tokens = run_ocr_pass(255 - img_bgr_ocr) if run_negated else []
                     
                     # Merge and deduplicate tokens (Spatial NMS based on Intersection over Min Area)
                     ocr_tokens = list(normal_tokens)
