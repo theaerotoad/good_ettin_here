@@ -1276,11 +1276,11 @@ class DocLayNetONNX:
         # Apply NMS
         keep_indices = self._nms(boxes_xyxy, valid_scores, valid_class_ids, iou_threshold=iou_thresh)
 
-        detections = []
+        raw_detections = []
         for idx in keep_indices:
             cid = int(valid_class_ids[idx])
             label_name = self.labels[cid] if cid < len(self.labels) else f"class_{cid}"
-            det_item = {
+            raw_detections.append({
                 "bbox": [
                     round(float(boxes_xyxy[idx, 0]), 2),
                     round(float(boxes_xyxy[idx, 1]), 2),
@@ -1290,11 +1290,39 @@ class DocLayNetONNX:
                 "confidence": round(float(valid_scores[idx]), 4),
                 "class_id": cid,
                 "label": label_name,
-            }
+            })
 
-            # If the detected region is a Table and table extraction is active, convert to HTML/Markdown
-            if extract_tables and self.table_recognizer is not None and label_name.lower() == "table":
-                bx1, by1, bx2, by2 = boxes_xyxy[idx]
+        # Class-agnostic deduplication: remove lower confidence boxes that heavily overlap
+        # across different classes (e.g., a Caption and Section-header predicted on the exact same text).
+        # We prioritize Tables so they are never accidentally suppressed by a text region.
+        raw_detections.sort(key=lambda x: (1 if x["label"].lower() == "table" else 0, x["confidence"]), reverse=True)
+        
+        detections = []
+        for d in raw_detections:
+            bx1, by1, bx2, by2 = d["bbox"]
+            b_area = max(0, bx2 - bx1) * max(0, by2 - by1)
+            is_dup = False
+            for keep_d in detections:
+                kx1, ky1, kx2, ky2 = keep_d["bbox"]
+                k_area = max(0, kx2 - kx1) * max(0, ky2 - ky1)
+                
+                ix1, iy1 = max(bx1, kx1), max(by1, ky1)
+                ix2, iy2 = min(bx2, kx2), min(by2, ky2)
+                inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+                
+                if min(b_area, k_area) > 0:
+                    ioma = inter / min(b_area, k_area)
+                    if ioma > 0.85:  # If 85% of the smaller box is covered, consider it a duplicate
+                        is_dup = True
+                        break
+            
+            if not is_dup:
+                detections.append(d)
+
+        # Extract Tables
+        for d in detections:
+            if extract_tables and self.table_recognizer is not None and d["label"].lower() == "table":
+                bx1, by1, bx2, by2 = d["bbox"]
                 cx1 = max(0, int(bx1) - 4)
                 cy1 = max(0, int(by1) - 4)
                 cx2 = min(orig_w, int(bx2) + 4)
@@ -1303,11 +1331,9 @@ class DocLayNetONNX:
                     crop = img.crop((cx1, cy1, cx2, cy2))
                     table_data = self.table_recognizer.extract(crop)
                     if table_data.get("html"):
-                        det_item["html"] = table_data["html"]
+                        d["html"] = table_data["html"]
                     if table_data.get("markdown"):
-                        det_item["markdown"] = table_data["markdown"]
-
-            detections.append(det_item)
+                        d["markdown"] = table_data["markdown"]
 
         # Sort detections in reading order (top-to-bottom, left-to-right)
         # We use a 20-pixel vertical bucket to group items on the same visual line
