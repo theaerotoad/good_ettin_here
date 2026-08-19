@@ -195,6 +195,15 @@ class TableRecognizerONNX:
         if b is None:
             return None
         try:
+            # If b is a tuple/list wrapping box and confidence (e.g. [box, score])
+            if (
+                isinstance(b, (list, tuple))
+                and len(b) == 2
+                and isinstance(b[1], (int, float, np.floating, np.integer))
+                and not isinstance(b[0], (int, float, np.floating, np.integer))
+            ):
+                b = b[0]
+
             arr = np.asarray(b, dtype=np.float32)
             if arr.size == 0:
                 return None
@@ -232,31 +241,58 @@ class TableRecognizerONNX:
         if self.table_engine is None:
             return pred_structures, pred_bboxes
 
+        raw_struct = None
+
         # Directly invoke table_structure if available (bypasses RapidTable internal OCR wrapper)
         if hasattr(self.table_engine, "table_structure"):
             try:
-                struct_res = self.table_engine.table_structure(img_bgr)
-                if isinstance(struct_res, (list, tuple)):
-                    if len(struct_res) >= 1 and struct_res[0] is not None:
-                        pred_structures = struct_res[0]
-                    if len(struct_res) >= 2 and struct_res[1] is not None:
-                        pred_bboxes = struct_res[1]
+                raw_struct = self.table_engine.table_structure(img_bgr)
             except Exception as e:
                 logger.warning(f"SLANet table_structure call failed: {e}")
 
         # Fallback to direct call on table_engine
-        if not pred_structures:
+        if raw_struct is None:
             try:
-                direct_out = self.table_engine(img_bgr)
-                if isinstance(direct_out, (list, tuple)):
-                    if len(direct_out) >= 1 and direct_out[0] is not None:
-                        pred_structures = direct_out[0]
-                    if len(direct_out) >= 2 and direct_out[1] is not None:
-                        pred_bboxes = direct_out[1]
-                elif isinstance(direct_out, str):
-                    pred_structures = direct_out
+                raw_struct = self.table_engine(img_bgr)
             except Exception as e:
                 logger.warning(f"SLANet direct call failed: {e}")
+
+        if raw_struct is None:
+            return pred_structures, pred_bboxes
+
+        # Handle varied return signatures from SLANet / RapidTable:
+        # 1. ((structures, bboxes), elapse)
+        # 2. (structures, bboxes, elapse)
+        # 3. (structures, bboxes)
+        # 4. structures
+        if isinstance(raw_struct, (list, tuple)):
+            if (
+                len(raw_struct) >= 1
+                and isinstance(raw_struct[0], (list, tuple))
+                and len(raw_struct[0]) == 2
+                and not isinstance(raw_struct[0][0], str)
+            ):
+                pred_structures = raw_struct[0][0]
+                pred_bboxes = raw_struct[0][1]
+            elif len(raw_struct) == 3 and isinstance(raw_struct[2], (int, float, np.floating, np.integer)):
+                pred_structures = raw_struct[0]
+                pred_bboxes = raw_struct[1]
+            elif len(raw_struct) >= 2 and (
+                isinstance(raw_struct[1], (list, np.ndarray))
+                or not isinstance(raw_struct[1], (int, float, np.floating, np.integer))
+            ):
+                pred_structures = raw_struct[0]
+                pred_bboxes = raw_struct[1]
+            elif len(raw_struct) >= 1:
+                if isinstance(raw_struct[0], (list, tuple)) and len(raw_struct[0]) == 2:
+                    pred_structures = raw_struct[0][0]
+                    pred_bboxes = raw_struct[0][1]
+                else:
+                    pred_structures = raw_struct[0]
+                    if len(raw_struct) >= 2 and not isinstance(raw_struct[1], (int, float, np.floating, np.integer)):
+                        pred_bboxes = raw_struct[1]
+        elif isinstance(raw_struct, str):
+            pred_structures = raw_struct
 
         # Unwrap batch dimension if present
         if isinstance(pred_structures, list) and len(pred_structures) == 1 and isinstance(pred_structures[0], list):
@@ -274,7 +310,7 @@ class TableRecognizerONNX:
         """Matches OCR tokens to SLANet cell coordinates and reconstructs full HTML table."""
         # Standardize cell bounding boxes to [[x1, y1, x2, y2], ...]
         cell_boxes = []
-        if pred_bboxes is not None:
+        if pred_bboxes is not None and not isinstance(pred_bboxes, (int, float)):
             for b in pred_bboxes:
                 norm_b = self._normalize_box(b)
                 if norm_b is not None:
@@ -318,19 +354,29 @@ class TableRecognizerONNX:
             cell_texts[c_idx] = " ".join(t["text"] for t in tokens)
 
         # Assemble HTML table using pred_structures tokens
-        if isinstance(pred_structures, list) and pred_structures:
+        if isinstance(pred_structures, (list, tuple)) and pred_structures:
             html_tokens = []
             cell_idx = 0
-            for tag in pred_structures:
-                tag_lower = tag.lower()
+            for item in pred_structures:
+                if isinstance(item, (list, tuple)):
+                    tag = str(item[0]) if len(item) > 0 else ""
+                elif isinstance(item, dict):
+                    tag = str(item.get("tag", item.get("text", "")))
+                else:
+                    tag = str(item) if item is not None else ""
+
+                if not tag:
+                    continue
+
+                tag_lower = tag.lower().strip()
                 if tag_lower.startswith("<td") or tag_lower.startswith("<th"):
                     text_val = cell_texts.get(cell_idx, "")
                     cell_idx += 1
                     if tag_lower.endswith("</td>"):
-                        tag_open = tag[:-5]
+                        tag_open = tag[: -len("</td>")]
                         html_tokens.append(f"{tag_open}{text_val}</td>")
                     elif tag_lower.endswith("</th>"):
-                        tag_open = tag[:-5]
+                        tag_open = tag[: -len("</th>")]
                         html_tokens.append(f"{tag_open}{text_val}</th>")
                     else:
                         html_tokens.append(f"{tag}{text_val}")

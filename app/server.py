@@ -390,13 +390,6 @@ def extract_table():
                 "type": "processing_error",
             }
         }), 500
-        logger.exception("Error running DocLayNet layout detection")
-        return jsonify({
-            "error": {
-                "message": str(e),
-                "type": "processing_error",
-            }
-        }), 500
 
 
 @app.route("/v1/rerank", methods=["POST", "OPTIONS"])
