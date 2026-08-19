@@ -4,7 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Ettin API Tester</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.tailwindcss.com?plugins=typography"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
 <body class="bg-gray-50 text-gray-800 font-sans p-6">
     <div class="max-w-5xl mx-auto space-y-8">
@@ -60,14 +61,22 @@
                 <input type="file" id="layout-file" class="mb-4 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 focus:outline-none" />
                 <button onclick="testMultipart('/v1/vision/layout', 'layout-file', 'layout-res')" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm transition focus:outline-none focus:ring-2 focus:ring-blue-500">Test Layout</button>
                 
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
-                    <div>
-                        <h3 class="text-xs font-semibold uppercase text-gray-500 mb-2">Raw JSON Response</h3>
-                        <pre id="layout-res" class="bg-gray-50 p-3 rounded text-xs overflow-auto h-80 border border-gray-100 text-gray-700"></pre>
+                <!-- Layout Output Tabs -->
+                <div class="mt-5 border-t pt-4">
+                    <div class="flex border-b border-gray-200 mb-3 space-x-4">
+                        <button onclick="switchTab('layout', 'render')" id="tab-layout-render-btn" class="py-2 px-3 text-sm font-medium border-b-2 border-blue-600 text-blue-600 focus:outline-none">Pretty Rendering</button>
+                        <button onclick="switchTab('layout', 'md')" id="tab-layout-md-btn" class="py-2 px-3 text-sm font-medium text-gray-500 hover:text-gray-700 focus:outline-none">Full Markdown</button>
+                        <button onclick="switchTab('layout', 'json')" id="tab-layout-json-btn" class="py-2 px-3 text-sm font-medium text-gray-500 hover:text-gray-700 focus:outline-none">Raw JSON</button>
                     </div>
-                    <div>
-                        <h3 class="text-xs font-semibold uppercase text-gray-500 mb-2">Extracted Markdown</h3>
-                        <pre id="layout-res-md" class="bg-white p-4 rounded text-sm font-mono overflow-auto h-80 border border-gray-200 text-gray-800 whitespace-pre-wrap"></pre>
+                    
+                    <div id="tab-layout-render" class="bg-white p-6 rounded border border-gray-200 prose prose-slate max-w-none h-96 overflow-auto">
+                        <div class="text-gray-400 italic">Rendered HTML output will appear here...</div>
+                    </div>
+                    <div id="tab-layout-md" class="hidden">
+                        <pre id="layout-res-md" class="bg-white p-4 rounded text-sm font-mono overflow-auto h-96 border border-gray-200 text-gray-800 whitespace-pre-wrap"></pre>
+                    </div>
+                    <div id="tab-layout-json" class="hidden">
+                        <pre id="layout-res" class="bg-gray-50 p-3 rounded text-xs overflow-auto h-96 border border-gray-100 text-gray-700"></pre>
                     </div>
                 </div>
             </div>
@@ -79,14 +88,22 @@
                 <input type="file" id="table-file" class="mb-4 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 focus:outline-none" />
                 <button onclick="testMultipart('/v1/vision/table', 'table-file', 'table-res')" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm transition focus:outline-none focus:ring-2 focus:ring-blue-500">Test Table</button>
                 
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
-                    <div>
-                        <h3 class="text-xs font-semibold uppercase text-gray-500 mb-2">Raw JSON Response</h3>
-                        <pre id="table-res" class="bg-gray-50 p-3 rounded text-xs overflow-auto h-64 border border-gray-100 text-gray-700"></pre>
+                <!-- Table Output Tabs -->
+                <div class="mt-5 border-t pt-4">
+                    <div class="flex border-b border-gray-200 mb-3 space-x-4">
+                        <button onclick="switchTab('table', 'render')" id="tab-table-render-btn" class="py-2 px-3 text-sm font-medium border-b-2 border-blue-600 text-blue-600 focus:outline-none">Pretty Rendering</button>
+                        <button onclick="switchTab('table', 'md')" id="tab-table-md-btn" class="py-2 px-3 text-sm font-medium text-gray-500 hover:text-gray-700 focus:outline-none">Generated Markdown</button>
+                        <button onclick="switchTab('table', 'json')" id="tab-table-json-btn" class="py-2 px-3 text-sm font-medium text-gray-500 hover:text-gray-700 focus:outline-none">Raw JSON</button>
                     </div>
-                    <div>
-                        <h3 class="text-xs font-semibold uppercase text-gray-500 mb-2">Generated Markdown</h3>
-                        <pre id="table-res-md" class="bg-white p-4 rounded text-sm font-mono overflow-auto h-64 border border-gray-200 text-gray-800 whitespace-pre-wrap"></pre>
+                    
+                    <div id="tab-table-render" class="bg-white p-6 rounded border border-gray-200 prose prose-slate max-w-none h-80 overflow-auto">
+                        <div class="text-gray-400 italic">Rendered table will appear here...</div>
+                    </div>
+                    <div id="tab-table-md" class="hidden">
+                        <pre id="table-res-md" class="bg-white p-4 rounded text-sm font-mono overflow-auto h-80 border border-gray-200 text-gray-800 whitespace-pre-wrap"></pre>
+                    </div>
+                    <div id="tab-table-json" class="hidden">
+                        <pre id="table-res" class="bg-gray-50 p-3 rounded text-xs overflow-auto h-80 border border-gray-100 text-gray-700"></pre>
                     </div>
                 </div>
             </div>
@@ -122,50 +139,73 @@
             }
         }
 
-        function extractMarkdownFromLayout(detections) {
-            if (!detections || detections.length === 0) return "No text elements detected.";
-            let md = "";
-            detections.forEach(det => {
-                let label = det.label.toLowerCase();
-                let text = det.text || "";
-                
-                if (label === 'title') md += `# ${text}\n\n`;
-                else if (label === 'section-header') md += `## ${text}\n\n`;
-                else if (label === 'list-item') md += `- ${text}\n`;
-                else if (label === 'table') {
-                    if (det.markdown) md += `${det.markdown}\n\n`;
-                    else md += `*[Table Detected]*\n\n`;
+        function switchTab(section, tab) {
+            const tabs = ['render', 'md', 'json'];
+            tabs.forEach(t => {
+                const panel = document.getElementById(`tab-${section}-${t}`);
+                const btn = document.getElementById(`tab-${section}-${t}-btn`);
+                if (t === tab) {
+                    panel.classList.remove('hidden');
+                    btn.className = "py-2 px-3 text-sm font-medium border-b-2 border-blue-600 text-blue-600 focus:outline-none";
+                } else {
+                    panel.classList.add('hidden');
+                    btn.className = "py-2 px-3 text-sm font-medium text-gray-500 hover:text-gray-700 focus:outline-none";
                 }
-                else if (label === 'picture') {
-                    md += `*[Picture Detected]*\n`;
-                    if (text) md += `Caption: ${text}\n\n`;
-                    else md += `\n`;
-                }
-                else if (label === 'formula') md += `$$ ${text} $$\n\n`;
-                else if (label === 'caption' || label === 'footnote') md += `> *${text}*\n\n`;
-                else if (label === 'page-header' || label === 'page-footer') {} // skip headers/footers to reduce noise
-                else md += `${text}\n\n`; // Default for 'text'
             });
-            return md.trim();
+        }
+
+        function extractMarkdownFromLayout(detections) {
+            if (!detections || detections.length === 0) return "No document layout regions detected.";
+            const mdLines = [];
+            const filename = "img.png";
+            const textLabels = new Set([
+                "caption", "footnote", "formula", "list-item",
+                "page-footer", "page-header", "section-header", "text", "title"
+            ]);
+
+            detections.forEach(d => {
+                const lbl = (d.label || "").toLowerCase();
+                if (lbl === "picture") {
+                    const text = d.text || "";
+                    const alt = text ? `Image with text: ${text}` : "Image";
+                    mdLines.push(`![${alt}](${filename})`);
+                } else if (lbl === "table") {
+                    if (d.markdown) {
+                        mdLines.push(d.markdown);
+                    } else if (d.html) {
+                        mdLines.push(d.html);
+                    }
+                } else if (textLabels.has(lbl)) {
+                    if (d.text) {
+                        mdLines.push(d.text);
+                    }
+                }
+            });
+
+            return mdLines.join("\n\n");
         }
 
         async function testMultipart(url, fileId, resId) {
             const resEl = document.getElementById(resId);
             const mdEl = document.getElementById(resId + '-md');
+            const renderEl = document.getElementById(resId === 'layout-res' ? 'tab-layout-render' : 'tab-table-render');
             const fileInput = document.getElementById(fileId);
             
             if (!fileInput.files.length) {
                 resEl.textContent = "Please select an image file first.";
                 if (mdEl) mdEl.textContent = "";
+                if (renderEl) renderEl.innerHTML = '<div class="text-red-500">Please select an image file first.</div>';
                 return;
             }
+            
             resEl.textContent = "Loading...";
             if (mdEl) mdEl.textContent = "Loading...";
+            if (renderEl) renderEl.innerHTML = '<div class="text-gray-400 italic">Processing image and running inference...</div>';
             
             try {
                 const formData = new FormData();
                 formData.append("file", fileInput.files[0]);
-                formData.append("extract_tables", "true"); // Always test table extraction when enabled
+                formData.append("extract_tables", "true");
                 
                 const response = await fetch(url, {
                     method: 'POST',
@@ -174,18 +214,34 @@
                 const data = await response.json();
                 resEl.textContent = JSON.stringify(data, null, 2);
                 
+                let extractedMd = "";
+                if (data.detections) {
+                    extractedMd = extractMarkdownFromLayout(data.detections);
+                } else if (data.markdown) {
+                    extractedMd = data.markdown;
+                } else if (data.results && data.results.length > 0 && data.results[0].detections) {
+                    extractedMd = extractMarkdownFromLayout(data.results[0].detections);
+                } else if (data.results && data.results.length > 0 && data.results[0].markdown) {
+                    extractedMd = data.results[0].markdown;
+                }
+
                 if (mdEl) {
-                    if (data.detections) {
-                        mdEl.textContent = extractMarkdownFromLayout(data.detections);
-                    } else if (data.markdown) {
-                        mdEl.textContent = data.markdown;
+                    mdEl.textContent = extractedMd || "No text content generated.";
+                }
+
+                if (renderEl) {
+                    if (extractedMd) {
+                        renderEl.innerHTML = marked.parse(extractedMd);
+                    } else if (data.html) {
+                        renderEl.innerHTML = data.html;
                     } else {
-                        mdEl.textContent = "No markdown available.";
+                        renderEl.innerHTML = '<div class="text-gray-400 italic">No content available to render.</div>';
                     }
                 }
             } catch (err) {
                 resEl.textContent = "Error: " + err.message;
                 if (mdEl) mdEl.textContent = "";
+                if (renderEl) renderEl.innerHTML = `<div class="text-red-500 font-semibold">Error: ${err.message}</div>`;
             }
         }
     </script>
