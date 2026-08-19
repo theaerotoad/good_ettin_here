@@ -54,21 +54,41 @@
             </div>
 
             <!-- Vision Layout -->
-            <div class="bg-white p-5 rounded-lg shadow-sm border border-gray-200">
+            <div class="bg-white p-5 rounded-lg shadow-sm border border-gray-200 md:col-span-2">
                 <h2 class="text-xl font-semibold mb-2">POST /v1/vision/layout</h2>
                 <p class="text-sm text-gray-600 mb-4">DocLayNet YOLOv8 Document Layout Analysis.</p>
                 <input type="file" id="layout-file" class="mb-4 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 focus:outline-none" />
                 <button onclick="testMultipart('/v1/vision/layout', 'layout-file', 'layout-res')" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm transition focus:outline-none focus:ring-2 focus:ring-blue-500">Test Layout</button>
-                <pre id="layout-res" class="mt-4 bg-gray-50 p-3 rounded text-xs overflow-auto max-h-48 border border-gray-100 text-gray-700"></pre>
+                
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+                    <div>
+                        <h3 class="text-xs font-semibold uppercase text-gray-500 mb-2">Raw JSON Response</h3>
+                        <pre id="layout-res" class="bg-gray-50 p-3 rounded text-xs overflow-auto h-80 border border-gray-100 text-gray-700"></pre>
+                    </div>
+                    <div>
+                        <h3 class="text-xs font-semibold uppercase text-gray-500 mb-2">Extracted Markdown</h3>
+                        <pre id="layout-res-md" class="bg-white p-4 rounded text-sm font-mono overflow-auto h-80 border border-gray-200 text-gray-800 whitespace-pre-wrap"></pre>
+                    </div>
+                </div>
             </div>
 
             <!-- Vision Table -->
-            <div class="bg-white p-5 rounded-lg shadow-sm border border-gray-200">
+            <div class="bg-white p-5 rounded-lg shadow-sm border border-gray-200 md:col-span-2">
                 <h2 class="text-xl font-semibold mb-2">POST /v1/vision/table</h2>
                 <p class="text-sm text-gray-600 mb-4">RapidTable SLANet structure extraction.</p>
                 <input type="file" id="table-file" class="mb-4 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 focus:outline-none" />
                 <button onclick="testMultipart('/v1/vision/table', 'table-file', 'table-res')" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm transition focus:outline-none focus:ring-2 focus:ring-blue-500">Test Table</button>
-                <pre id="table-res" class="mt-4 bg-gray-50 p-3 rounded text-xs overflow-auto max-h-48 border border-gray-100 text-gray-700"></pre>
+                
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+                    <div>
+                        <h3 class="text-xs font-semibold uppercase text-gray-500 mb-2">Raw JSON Response</h3>
+                        <pre id="table-res" class="bg-gray-50 p-3 rounded text-xs overflow-auto h-64 border border-gray-100 text-gray-700"></pre>
+                    </div>
+                    <div>
+                        <h3 class="text-xs font-semibold uppercase text-gray-500 mb-2">Generated Markdown</h3>
+                        <pre id="table-res-md" class="bg-white p-4 rounded text-sm font-mono overflow-auto h-64 border border-gray-200 text-gray-800 whitespace-pre-wrap"></pre>
+                    </div>
+                </div>
             </div>
 
         </div>
@@ -102,17 +122,50 @@
             }
         }
 
+        function extractMarkdownFromLayout(detections) {
+            if (!detections || detections.length === 0) return "No text elements detected.";
+            let md = "";
+            detections.forEach(det => {
+                let label = det.label.toLowerCase();
+                let text = det.text || "";
+                
+                if (label === 'title') md += `# ${text}\n\n`;
+                else if (label === 'section-header') md += `## ${text}\n\n`;
+                else if (label === 'list-item') md += `- ${text}\n`;
+                else if (label === 'table') {
+                    if (det.markdown) md += `${det.markdown}\n\n`;
+                    else md += `*[Table Detected]*\n\n`;
+                }
+                else if (label === 'picture') {
+                    md += `*[Picture Detected]*\n`;
+                    if (text) md += `Caption: ${text}\n\n`;
+                    else md += `\n`;
+                }
+                else if (label === 'formula') md += `$$ ${text} $$\n\n`;
+                else if (label === 'caption' || label === 'footnote') md += `> *${text}*\n\n`;
+                else if (label === 'page-header' || label === 'page-footer') {} // skip headers/footers to reduce noise
+                else md += `${text}\n\n`; // Default for 'text'
+            });
+            return md.trim();
+        }
+
         async function testMultipart(url, fileId, resId) {
             const resEl = document.getElementById(resId);
+            const mdEl = document.getElementById(resId + '-md');
             const fileInput = document.getElementById(fileId);
+            
             if (!fileInput.files.length) {
                 resEl.textContent = "Please select an image file first.";
+                if (mdEl) mdEl.textContent = "";
                 return;
             }
             resEl.textContent = "Loading...";
+            if (mdEl) mdEl.textContent = "Loading...";
+            
             try {
                 const formData = new FormData();
                 formData.append("file", fileInput.files[0]);
+                formData.append("extract_tables", "true"); // Always test table extraction when enabled
                 
                 const response = await fetch(url, {
                     method: 'POST',
@@ -120,8 +173,19 @@
                 });
                 const data = await response.json();
                 resEl.textContent = JSON.stringify(data, null, 2);
+                
+                if (mdEl) {
+                    if (data.detections) {
+                        mdEl.textContent = extractMarkdownFromLayout(data.detections);
+                    } else if (data.markdown) {
+                        mdEl.textContent = data.markdown;
+                    } else {
+                        mdEl.textContent = "No markdown available.";
+                    }
+                }
             } catch (err) {
                 resEl.textContent = "Error: " + err.message;
+                if (mdEl) mdEl.textContent = "";
             }
         }
     </script>
