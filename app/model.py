@@ -433,10 +433,47 @@ class TableRecognizerONNX:
                 curr_row.sort(key=lambda item: item["bbox"][0])
                 rows.append(curr_row)
 
+            # Cluster columns based on x-coordinates
+            all_x = [t["center"][0] for row in rows for t in row]
+            all_x.sort()
+            
+            cols = []
+            if all_x:
+                curr_c = [all_x[0]]
+                for x in all_x[1:]:
+                    # 25px threshold to group items into the same column
+                    if x - (sum(curr_c) / len(curr_c)) < 25.0:
+                        curr_c.append(x)
+                    else:
+                        cols.append(sum(curr_c) / len(curr_c))
+                        curr_c = [x]
+                if curr_c:
+                    cols.append(sum(curr_c) / len(curr_c))
+
             table_rows_html = []
             for row in rows:
-                row_tds = "".join(f"<td>{t['text']}</td>" for t in row)
-                table_rows_html.append(f"<tr>{row_tds}</tr>")
+                row_tds = []
+                col_idx = 0
+                for t in row:
+                    cx = t["center"][0]
+                    # Find closest column
+                    best_c = min(range(len(cols)), key=lambda i: abs(cols[i] - cx))
+                    
+                    # Fill with empty cells if we skipped columns (e.g., indentation)
+                    while col_idx < best_c:
+                        row_tds.append("<td></td>")
+                        col_idx += 1
+                        
+                    row_tds.append(f"<td>{t['text']}</td>")
+                    # Advance col_idx to prevent overwriting if multiple tokens share a column
+                    col_idx = max(col_idx + 1, best_c + 1)
+                    
+                # Fill remaining columns
+                while col_idx < len(cols):
+                    row_tds.append("<td></td>")
+                    col_idx += 1
+                    
+                table_rows_html.append(f"<tr>{''.join(row_tds)}</tr>")
             html_output = f"<table>{''.join(table_rows_html)}</table>"
 
         return html_output
