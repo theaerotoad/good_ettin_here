@@ -243,14 +243,19 @@ class TableRecognizerONNX:
 
         raw_struct = None
 
-        # Directly invoke table_structure if available (bypasses RapidTable internal OCR wrapper)
-        if hasattr(self.table_engine, "table_structure"):
-            try:
-                raw_struct = self.table_engine.table_structure(img_bgr)
-            except Exception as e:
-                logger.warning(f"SLANet table_structure call failed: {e}")
+        # 1. Try to bypass RapidTable's internal OCR wrapper by accessing the core SLANet model directly
+        for attr in ["table_model", "table_structure", "structure_model", "model"]:
+            if hasattr(self.table_engine, attr):
+                internal_model = getattr(self.table_engine, attr)
+                if callable(internal_model):
+                    try:
+                        raw_struct = internal_model(img_bgr)
+                        if raw_struct is not None:
+                            break
+                    except Exception as e:
+                        logger.warning(f"Internal model '{attr}' call failed: {e}")
 
-        # Fallback to direct call on table_engine
+        # 2. Fallback to direct call on table_engine
         if raw_struct is None:
             try:
                 raw_struct = self.table_engine(img_bgr)
@@ -260,38 +265,28 @@ class TableRecognizerONNX:
         if raw_struct is None:
             return pred_structures, pred_bboxes
 
-        # Handle varied return signatures from SLANet / RapidTable:
-        # 1. ((structures, bboxes), elapse)
-        # 2. (structures, bboxes, elapse)
-        # 3. (structures, bboxes)
-        # 4. structures
+        # 3. Robust unpacking: Find structures (strings/tags) and bboxes (coords) dynamically
+        candidates = []
         if isinstance(raw_struct, (list, tuple)):
-            if (
-                len(raw_struct) >= 1
-                and isinstance(raw_struct[0], (list, tuple))
-                and len(raw_struct[0]) == 2
-                and not isinstance(raw_struct[0][0], str)
-            ):
-                pred_structures = raw_struct[0][0]
-                pred_bboxes = raw_struct[0][1]
-            elif len(raw_struct) == 3 and isinstance(raw_struct[2], (int, float, np.floating, np.integer)):
-                pred_structures = raw_struct[0]
-                pred_bboxes = raw_struct[1]
-            elif len(raw_struct) >= 2 and (
-                isinstance(raw_struct[1], (list, np.ndarray))
-                or not isinstance(raw_struct[1], (int, float, np.floating, np.integer))
-            ):
-                pred_structures = raw_struct[0]
-                pred_bboxes = raw_struct[1]
-            elif len(raw_struct) >= 1:
-                if isinstance(raw_struct[0], (list, tuple)) and len(raw_struct[0]) == 2:
-                    pred_structures = raw_struct[0][0]
-                    pred_bboxes = raw_struct[0][1]
+            for item in raw_struct:
+                if isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[0], (list, tuple)):
+                    candidates.extend([item[0], item[1]])
                 else:
-                    pred_structures = raw_struct[0]
-                    if len(raw_struct) >= 2 and not isinstance(raw_struct[1], (int, float, np.floating, np.integer)):
-                        pred_bboxes = raw_struct[1]
-        elif isinstance(raw_struct, str):
+                    candidates.append(item)
+        else:
+            candidates = [raw_struct]
+
+        for cand in candidates:
+            if isinstance(cand, (list, tuple, np.ndarray)) and len(cand) > 0:
+                # Check if it contains structure tags
+                if isinstance(cand[0], str) or (isinstance(cand[0], dict) and "tag" in cand[0]):
+                    pred_structures = cand
+                # Check if it contains numeric bounding boxes
+                elif isinstance(cand[0], (list, tuple, np.ndarray)) and len(cand[0]) >= 2:
+                    if not isinstance(cand[0][0], str):
+                        pred_bboxes = cand
+
+        if not pred_structures and isinstance(raw_struct, str):
             pred_structures = raw_struct
 
         # Unwrap batch dimension if present
@@ -308,13 +303,11 @@ class TableRecognizerONNX:
         self, pred_structures: list, pred_bboxes: list, ocr_tokens: list[dict]
     ) -> str:
         """Matches OCR tokens to SLANet cell coordinates and reconstructs full HTML table."""
-        # Standardize cell bounding boxes to [[x1, y1, x2, y2], ...]
+        # Standardize cell bounding boxes to [[x1, y1, x2, y2], ...]. Append None to maintain index alignment!
         cell_boxes = []
         if pred_bboxes is not None and not isinstance(pred_bboxes, (int, float)):
             for b in pred_bboxes:
-                norm_b = self._normalize_box(b)
-                if norm_b is not None:
-                    cell_boxes.append(norm_b)
+                cell_boxes.append(self._normalize_box(b))
 
         # Map each OCR token to its best overlapping or enclosing cell box
         cell_to_tokens = {i: [] for i in range(len(cell_boxes))}
@@ -326,7 +319,12 @@ class TableRecognizerONNX:
             matched_idx = None
             best_overlap = 0.0
 
-            for c_idx, (bx1, by1, bx2, by2) in enumerate(cell_boxes):
+            for c_idx, norm_b in enumerate(cell_boxes):
+                if norm_b is None:
+                    continue
+                    
+                bx1, by1, bx2, by2 = norm_b
+                
                 # 1. Point-in-box check (with 3px tolerance)
                 if (bx1 - 3.0) <= cx <= (bx2 + 3.0) and (by1 - 3.0) <= cy <= (by2 + 3.0):
                     matched_idx = c_idx
@@ -389,8 +387,11 @@ class TableRecognizerONNX:
         else:
             html_output = ""
 
-        # Fallback: if SLANet output was empty or invalid, build table rows directly from clustered OCR tokens
-        if (not html_output or "<table" not in html_output.lower()) and ocr_tokens:
+        # Check if we successfully mapped any text into the structured table
+        has_text = any(bool(text.strip()) for text in cell_texts.values())
+
+        # Fallback: if SLANet output was empty, invalid, or we couldn't map any text, build table rows directly from clustered OCR tokens
+        if (not html_output or "<table" not in html_output.lower() or not has_text) and ocr_tokens:
             sorted_ocr = sorted(ocr_tokens, key=lambda t: t["bbox"][1])
             rows = []
             curr_row = []
