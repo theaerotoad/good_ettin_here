@@ -206,8 +206,22 @@ class TableRecognizerONNX:
                 logger.debug(f"OCR pass failed: {e}")
             return toks
 
-        normal_tokens = run_pass(img_bgr)
-        negated_tokens = run_pass(255 - img_bgr)
+        # Heuristic to skip unnecessary OCR passes based on crop polarity
+        gray = np.dot(img_bgr[..., :3], [0.114, 0.587, 0.299])
+        total_px = gray.size
+        run_normal = True
+        run_negated = True
+
+        if total_px > 0:
+            light_pct = np.sum(gray > 170) / total_px
+            dark_pct = np.sum(gray < 85) / total_px
+            if light_pct > 0.85:
+                run_negated = False
+            elif dark_pct > 0.85:
+                run_normal = False
+
+        normal_tokens = run_pass(img_bgr) if run_normal else []
+        negated_tokens = run_pass(255 - img_bgr) if run_negated else []
 
         # Merge and deduplicate tokens (Intersection over Min Area)
         ocr_tokens = list(normal_tokens)
@@ -1291,6 +1305,32 @@ class DocLayNetONNX:
                 try:
                     img_bgr = np.asarray(img.convert("RGB"))[:, :, ::-1].copy()
                     
+                    # Heuristic to skip unnecessary OCR passes based on region polarity
+                    gray = np.dot(img_bgr[..., :3], [0.114, 0.587, 0.299])
+                    run_normal = False
+                    run_negated = False
+                    
+                    for det in detections:
+                        if det["label"] in text_labels:
+                            bx1, by1, bx2, by2 = [int(v) for v in det["bbox"]]
+                            bx1, by1 = max(0, bx1), max(0, by1)
+                            bx2, by2 = min(gray.shape[1], bx2), min(gray.shape[0], by2)
+                            
+                            if bx2 > bx1 and by2 > by1:
+                                crop = gray[by1:by2, bx1:bx2]
+                                total_px = crop.size
+                                if total_px > 0:
+                                    light_pct = np.sum(crop > 170) / total_px
+                                    dark_pct = np.sum(crop < 85) / total_px
+                                    if light_pct < 0.85:
+                                        run_negated = True
+                                    if dark_pct < 0.85:
+                                        run_normal = True
+                                        
+                    # Fallback if no valid regions triggered it
+                    if not run_normal and not run_negated:
+                        run_normal = True
+
                     def run_ocr_pass(image_array):
                         out = self.ocr_engine(image_array)
                         raw = out[0] if isinstance(out, (list, tuple)) and len(out) > 0 else out
@@ -1320,8 +1360,8 @@ class DocLayNetONNX:
                                 })
                         return toks
 
-                    normal_tokens = run_ocr_pass(img_bgr)
-                    negated_tokens = run_ocr_pass(255 - img_bgr)
+                    normal_tokens = run_ocr_pass(img_bgr) if run_normal else []
+                    negated_tokens = run_ocr_pass(255 - img_bgr) if run_negated else []
                     
                     # Merge and deduplicate tokens (Spatial NMS based on Intersection over Min Area)
                     ocr_tokens = list(normal_tokens)
