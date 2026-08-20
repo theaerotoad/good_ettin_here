@@ -35,7 +35,8 @@ hf download cross-encoder/ettin-reranker-150m-v1  --local-dir ./ettinreranker_mo
 hf download onnx-community/embeddinggemma-300m-ONNX --local-dir ./embeddinggemma_model
 
 # 3. Document Layout Analysis (DocLayNet YOLOv8)
-hf download neuralshift/doc-layout-yolov8n --local-dir ./doclaynet_model
+hf download Oblix/yolov8x-doclaynet_ONNX --local-dir ./doclaynet_model
+
 # Note: SLANet (for table extraction) weights are downloaded automatically by rapid-table on first run.
 
 ```
