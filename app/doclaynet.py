@@ -654,6 +654,7 @@ class DocLayNetONNX:
                     logger.warning(f"Text extraction failed during layout analysis: {e}")
 
         if extract_text:
+            absorbed_text_ids = set()
             # Map text from text regions to any Pictures that contain them
             for pic_det in detections:
                 if pic_det["label"] == "Picture":
@@ -670,8 +671,12 @@ class DocLayNetONNX:
                             # If >50% of the text box is physically inside the picture, associate it
                             if det_area > 0 and inter_area / det_area > 0.5:
                                 pic_texts.append(det["text"].replace('\n', '\\n'))
+                                absorbed_text_ids.add(id(det))
                     
                     if pic_texts:
                         pic_det["text"] = "\\n".join(pic_texts)
+            
+            # Remove the text regions that were absorbed into pictures so they don't repeat
+            detections = [d for d in detections if id(d) not in absorbed_text_ids]
 
         return detections, (orig_w, orig_h)
