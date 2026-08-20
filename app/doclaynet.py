@@ -467,8 +467,8 @@ class DocLayNetONNX:
         # We use a 20-pixel vertical bucket to group items on the same visual line
         detections.sort(key=lambda d: (int(d["bbox"][1] / 20.0), d["bbox"][0]))
 
-        # Extract text for text-like elements (including Pictures) if requested
-        text_labels = {"Caption", "Footnote", "Formula", "List-item", "Page-footer", "Page-header", "Picture", "Section-header", "Text", "Title"}
+        # Extract text for text-like elements (excluding Pictures) if requested
+        text_labels = {"Caption", "Footnote", "Formula", "List-item", "Page-footer", "Page-header", "Section-header", "Text", "Title"}
         if extract_text and (self.use_tesseract or self.ocr_engine is not None):
             needs_ocr = any(d["label"] in text_labels for d in detections)
             
@@ -499,8 +499,6 @@ class DocLayNetONNX:
                                 # psm 6 assumes a single uniform block of text
                                 text = pytesseract.image_to_string(crop, config='--psm 6').strip()
                                 if text:
-                                    if det["label"] == "Picture":
-                                        text = text.replace('\n', '\\n')
                                     det["text"] = text
                             except Exception as e:
                                 logger.debug(f"Tesseract extraction failed: {e}")
@@ -651,11 +649,29 @@ class DocLayNetONNX:
                                 if curr_line:
                                     lines.append(" ".join(curr_line))
 
-                                if det["label"] == "Picture":
-                                    det["text"] = "\\n".join(lines)
-                                else:
-                                    det["text"] = "\n".join(lines)
+                                det["text"] = "\n".join(lines)
                 except Exception as e:
                     logger.warning(f"Text extraction failed during layout analysis: {e}")
+
+        if extract_text:
+            # Map text from text regions to any Pictures that contain them
+            for pic_det in detections:
+                if pic_det["label"] == "Picture":
+                    px1, py1, px2, py2 = pic_det["bbox"]
+                    pic_texts = []
+                    for det in detections:
+                        if det["label"] in text_labels and det.get("text"):
+                            bx1, by1, bx2, by2 = det["bbox"]
+                            ix1, iy1 = max(px1, bx1), max(py1, by1)
+                            ix2, iy2 = min(px2, bx2), min(py2, by2)
+                            inter_area = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+                            det_area = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+                            
+                            # If >50% of the text box is physically inside the picture, associate it
+                            if det_area > 0 and inter_area / det_area > 0.5:
+                                pic_texts.append(det["text"].replace('\n', '\\n'))
+                    
+                    if pic_texts:
+                        pic_det["text"] = "\\n".join(pic_texts)
 
         return detections, (orig_w, orig_h)
