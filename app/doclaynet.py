@@ -167,23 +167,29 @@ class DocLayNetONNX:
         """Helper to load an image with Pillow and a fallback to ImageMagick for WMF/EPS."""
         import tempfile
         import subprocess
+        img = None
         try:
             if isinstance(source, bytes):
-                return Image.open(io.BytesIO(source)).convert("RGB")
+                img = Image.open(io.BytesIO(source))
             elif isinstance(source, io.BytesIO):
                 source.seek(0)
-                return Image.open(source).convert("RGB")
+                img = Image.open(source)
             else:
-                return Image.open(source).convert("RGB")
+                img = Image.open(source)
+            return img.convert("RGB")
         except Exception as e:
             logger.debug(f"Pillow load failed: {e}. Falling back to ImageMagick.")
             with tempfile.TemporaryDirectory() as tmpdir:
+                ext = "tmp"
+                if img is not None and hasattr(img, 'format') and img.format:
+                    ext = str(img.format).lower()
+                
                 if isinstance(source, (bytes, bytearray)):
-                    in_path = os.path.join(tmpdir, "input.tmp")
+                    in_path = os.path.join(tmpdir, f"input.{ext}")
                     with open(in_path, "wb") as f:
                         f.write(source)
                 elif isinstance(source, io.BytesIO):
-                    in_path = os.path.join(tmpdir, "input.tmp")
+                    in_path = os.path.join(tmpdir, f"input.{ext}")
                     with open(in_path, "wb") as f:
                         f.write(source.getvalue())
                 else:
@@ -191,19 +197,26 @@ class DocLayNetONNX:
                     
                 out_path = os.path.join(tmpdir, "output.png")
                 success = False
+                last_err = ""
                 for cmd in ["magick", "convert"]:
                     try:
                         subprocess.run(
                             [cmd, "-density", "300", in_path, out_path],
-                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
                         )
                         success = True
                         break
-                    except (subprocess.CalledProcessError, FileNotFoundError):
+                    except subprocess.CalledProcessError as cpe:
+                        last_err = cpe.stderr.strip()
+                        continue
+                    except FileNotFoundError:
                         continue
                 
                 if not success:
-                    raise ValueError(f"ImageMagick fallback failed. Original Pillow error: {e}")
+                    err_msg = f"ImageMagick fallback failed. Pillow err: {e}."
+                    if last_err:
+                        err_msg += f" ImageMagick err: {last_err}"
+                    raise ValueError(err_msg)
                 
                 if os.path.exists(out_path):
                     final_path = out_path
