@@ -163,25 +163,77 @@ class DocLayNetONNX:
         except Exception:
             pass
 
+    def _safe_load_pil(self, source) -> Image.Image:
+        """Helper to load an image with Pillow and a fallback to ImageMagick for WMF/EPS."""
+        import tempfile
+        import subprocess
+        try:
+            if isinstance(source, bytes):
+                return Image.open(io.BytesIO(source)).convert("RGB")
+            elif isinstance(source, io.BytesIO):
+                source.seek(0)
+                return Image.open(source).convert("RGB")
+            else:
+                return Image.open(source).convert("RGB")
+        except Exception as e:
+            logger.debug(f"Pillow load failed: {e}. Falling back to ImageMagick.")
+            with tempfile.TemporaryDirectory() as tmpdir:
+                if isinstance(source, (bytes, bytearray)):
+                    in_path = os.path.join(tmpdir, "input.tmp")
+                    with open(in_path, "wb") as f:
+                        f.write(source)
+                elif isinstance(source, io.BytesIO):
+                    in_path = os.path.join(tmpdir, "input.tmp")
+                    with open(in_path, "wb") as f:
+                        f.write(source.getvalue())
+                else:
+                    in_path = str(source)
+                    
+                out_path = os.path.join(tmpdir, "output.png")
+                success = False
+                for cmd in ["magick", "convert"]:
+                    try:
+                        subprocess.run(
+                            [cmd, "-density", "300", in_path, out_path],
+                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                        )
+                        success = True
+                        break
+                    except (subprocess.CalledProcessError, FileNotFoundError):
+                        continue
+                
+                if not success:
+                    raise ValueError(f"ImageMagick fallback failed. Original Pillow error: {e}")
+                
+                if os.path.exists(out_path):
+                    final_path = out_path
+                elif os.path.exists(os.path.join(tmpdir, "output-0.png")):
+                    final_path = os.path.join(tmpdir, "output-0.png")
+                else:
+                    raise ValueError(f"ImageMagick fallback produced no output. Original Pillow error: {e}")
+                    
+                with Image.open(final_path) as tmp_img:
+                    return tmp_img.convert("RGB").copy()
+
     def _load_image(self, image_input) -> Image.Image:
         """Loads and converts image inputs (PIL Image, bytes, base64 data URI, HTTP URL, or local path) to RGB."""
         if isinstance(image_input, Image.Image):
             return image_input.convert("RGB")
         if isinstance(image_input, bytes):
-            return Image.open(io.BytesIO(image_input)).convert("RGB")
+            return self._safe_load_pil(image_input)
         if isinstance(image_input, str):
             if image_input.startswith("data:image"):
                 base64_data = image_input.split(",", 1)[1]
-                return Image.open(io.BytesIO(base64.b64decode(base64_data))).convert("RGB")
+                return self._safe_load_pil(base64.b64decode(base64_data))
             if image_input.startswith("http://") or image_input.startswith("https://"):
                 resp = requests.get(image_input, timeout=15)
                 resp.raise_for_status()
-                return Image.open(io.BytesIO(resp.content)).convert("RGB")
+                return self._safe_load_pil(resp.content)
             if os.path.exists(image_input):
-                return Image.open(image_input).convert("RGB")
+                return self._safe_load_pil(image_input)
             try:
                 raw_bytes = base64.b64decode(image_input)
-                return Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+                return self._safe_load_pil(raw_bytes)
             except Exception:
                 raise ValueError(f"Could not decode image string: {image_input[:60]}...")
         raise TypeError(f"Unsupported image input type: {type(image_input)}")

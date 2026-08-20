@@ -62,7 +62,55 @@ class TableRecognizer:
         self.ocr_engine = RapidOCR(**ocr_kwargs)
         self.table_engine = RapidTable(**table_kwargs)
 
-    def _prepare_image(self, image_input: Union[str, Path, np.ndarray, Image.Image]) -> np.ndarray:
+    def _safe_load_bgr(self, source) -> np.ndarray:
+        """Helper to load image via Pillow with ImageMagick fallback, then return BGR numpy array."""
+        import tempfile
+        import subprocess
+        import io
+        try:
+            if isinstance(source, bytes):
+                img = Image.open(io.BytesIO(source)).convert("RGB")
+            else:
+                img = Image.open(source).convert("RGB")
+            rgb_arr = np.array(img)
+            return cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2BGR)
+        except Exception as e:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                if isinstance(source, (bytes, bytearray)):
+                    in_path = os.path.join(tmpdir, "input.tmp")
+                    with open(in_path, "wb") as f:
+                        f.write(source)
+                else:
+                    in_path = str(source)
+                    
+                out_path = os.path.join(tmpdir, "output.png")
+                success = False
+                for cmd in ["magick", "convert"]:
+                    try:
+                        subprocess.run(
+                            [cmd, "-density", "300", in_path, out_path],
+                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                        )
+                        success = True
+                        break
+                    except (subprocess.CalledProcessError, FileNotFoundError):
+                        continue
+                
+                if not success:
+                    raise ValueError(f"ImageMagick fallback failed. Original error: {e}")
+                
+                if os.path.exists(out_path):
+                    final_path = out_path
+                elif os.path.exists(os.path.join(tmpdir, "output-0.png")):
+                    final_path = os.path.join(tmpdir, "output-0.png")
+                else:
+                    raise ValueError(f"ImageMagick fallback produced no output. Original error: {e}")
+                    
+                with Image.open(final_path) as tmp_img:
+                    rgb_arr = np.array(tmp_img.convert("RGB"))
+                    return cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2BGR)
+
+    def _prepare_image(self, image_input: Union[str, Path, bytes, np.ndarray, Image.Image]) -> np.ndarray:
         """
         Converts different image inputs into a standard BGR numpy array.
         """
@@ -72,11 +120,18 @@ class TableRecognizer:
                 raise FileNotFoundError(f"Image not found at path: {path_str}")
             image = cv2.imread(path_str)
             if image is None:
-                raise ValueError(f"Failed to read image from path: {path_str}")
+                # cv2.imread fails on EPS/WMF natively, apply fallback
+                return self._safe_load_bgr(path_str)
             return image
 
+        if isinstance(image_input, bytes):
+            return self._safe_load_bgr(image_input)
+
         if isinstance(image_input, Image.Image):
-            rgb_image = np.array(image_input.convert("RGB"))
+            try:
+                rgb_image = np.array(image_input.convert("RGB"))
+            except Exception:
+                raise ValueError("Failed to convert PIL Image to RGB")
             return cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
 
         if isinstance(image_input, np.ndarray):
@@ -88,7 +143,7 @@ class TableRecognizer:
 
     def extract(
         self,
-        image: Union[str, Path, np.ndarray, Image.Image],
+        image: Union[str, Path, bytes, np.ndarray, Image.Image],
     ) -> TableResult:
         """
         Performs OCR text recognition and SLANet structure extraction on the image.

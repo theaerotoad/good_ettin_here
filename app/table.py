@@ -426,14 +426,68 @@ class TableRecognizerONNX:
 
         return html_output
 
+    def _safe_load_bgr(self, source) -> np.ndarray:
+        """Helper to load image with ImageMagick fallback for WMF/EPS formats."""
+        import tempfile
+        import subprocess
+        import io
+        try:
+            if isinstance(source, bytes):
+                img = Image.open(io.BytesIO(source)).convert("RGB")
+            else:
+                img = Image.open(source).convert("RGB")
+            rgb_arr = np.asarray(img)
+            return rgb_arr[:, :, ::-1].copy()
+        except Exception as e:
+            logger.debug(f"Pillow load failed: {e}. Falling back to ImageMagick.")
+            with tempfile.TemporaryDirectory() as tmpdir:
+                if isinstance(source, (bytes, bytearray)):
+                    in_path = os.path.join(tmpdir, "input.tmp")
+                    with open(in_path, "wb") as f:
+                        f.write(source)
+                else:
+                    in_path = str(source)
+                    
+                out_path = os.path.join(tmpdir, "output.png")
+                success = False
+                for cmd in ["magick", "convert"]:
+                    try:
+                        subprocess.run(
+                            [cmd, "-density", "300", in_path, out_path],
+                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                        )
+                        success = True
+                        break
+                    except (subprocess.CalledProcessError, FileNotFoundError):
+                        continue
+                
+                if not success:
+                    raise ValueError(f"ImageMagick fallback failed. Original error: {e}")
+                
+                if os.path.exists(out_path):
+                    final_path = out_path
+                elif os.path.exists(os.path.join(tmpdir, "output-0.png")):
+                    final_path = os.path.join(tmpdir, "output-0.png")
+                else:
+                    raise ValueError(f"ImageMagick fallback produced no output. Original error: {e}")
+                    
+                with Image.open(final_path) as tmp_img:
+                    rgb_arr = np.asarray(tmp_img.convert("RGB"))
+                    return rgb_arr[:, :, ::-1].copy()
+
     def extract(self, image_input) -> dict:
         if self.table_engine is None and self.ocr_engine is None:
             return {"html": "", "markdown": ""}
 
         # Standardize input to OpenCV BGR numpy array
         if isinstance(image_input, Image.Image):
-            rgb_arr = np.asarray(image_input.convert("RGB"))
-            img_bgr = rgb_arr[:, :, ::-1].copy()
+            try:
+                rgb_arr = np.asarray(image_input.convert("RGB"))
+                img_bgr = rgb_arr[:, :, ::-1].copy()
+            except Exception as e:
+                # If Pillow lazy-loading fails (e.g. truncated image)
+                logger.warning(f"PIL conversion failed, skipping: {e}")
+                return {"html": "", "markdown": ""}
         elif isinstance(image_input, np.ndarray):
             if image_input.ndim == 2:
                 img_bgr = np.stack([image_input] * 3, axis=-1).copy()
@@ -441,6 +495,12 @@ class TableRecognizerONNX:
                 img_bgr = image_input.copy()
             else:
                 img_bgr = image_input[:, :, :3].copy()
+        elif isinstance(image_input, (str, bytes)):
+            try:
+                img_bgr = self._safe_load_bgr(image_input)
+            except Exception as e:
+                logger.warning(f"Fallback loading failed: {e}")
+                return {"html": "", "markdown": ""}
         else:
             return {"html": "", "markdown": ""}
 
