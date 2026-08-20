@@ -437,6 +437,10 @@ class DocLayNetONNX:
                 if min(b_area, k_area) > 0:
                     ioma = inter / min(b_area, k_area)
                     if ioma > 0.85:  # If 85% of the smaller box is covered, consider it a duplicate
+                        # Allow Text/Title elements to coexist inside Pictures without being suppressed
+                        if (d["label"] == "Picture" and keep_d["label"] != "Picture") or \
+                           (keep_d["label"] == "Picture" and d["label"] != "Picture"):
+                            continue
                         is_dup = True
                         break
             
@@ -543,6 +547,17 @@ class DocLayNetONNX:
                     else:
                         img_bgr_ocr = img_bgr
 
+                    # Mask the image to ONLY include the specific bounding boxes detected as text.
+                    # This prevents OCR-ing the entire image (or entire figures) and reduces hallucinations.
+                    img_bgr_ocr_masked = np.full_like(img_bgr_ocr, 255)
+                    for det in detections:
+                        if det["label"] in text_labels:
+                            mx1, my1, mx2, my2 = [int(v * scale_factor) for v in det["bbox"]]
+                            mx1, my1 = max(0, mx1), max(0, my1)
+                            mx2, my2 = min(img_bgr_ocr.shape[1], mx2), min(img_bgr_ocr.shape[0], my2)
+                            if mx2 > mx1 and my2 > my1:
+                                img_bgr_ocr_masked[my1:my2, mx1:mx2] = img_bgr_ocr[my1:my2, mx1:mx2]
+
                     def run_ocr_pass(image_array):
                         out = self.ocr_engine(image_array)
                         raw = out[0] if isinstance(out, (list, tuple)) and len(out) > 0 else out
@@ -577,8 +592,8 @@ class DocLayNetONNX:
                                 })
                         return toks
 
-                    normal_tokens = run_ocr_pass(img_bgr_ocr) if run_normal else []
-                    negated_tokens = run_ocr_pass(255 - img_bgr_ocr) if run_negated else []
+                    normal_tokens = run_ocr_pass(img_bgr_ocr_masked) if run_normal else []
+                    negated_tokens = run_ocr_pass(255 - img_bgr_ocr_masked) if run_negated else []
                     
                     # Merge and deduplicate tokens (Spatial NMS based on Intersection over Min Area)
                     ocr_tokens = list(normal_tokens)
