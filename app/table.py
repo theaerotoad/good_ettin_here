@@ -442,9 +442,18 @@ class TableRecognizerONNX:
         except Exception as e:
             logger.debug(f"Pillow load failed: {e}. Falling back to ImageMagick.")
             with tempfile.TemporaryDirectory() as tmpdir:
+                header = b""
+                if isinstance(source, (bytes, bytearray)):
+                    header = source[:128]
+                elif isinstance(source, str) and os.path.exists(source):
+                    with open(source, "rb") as f:
+                        header = f.read(128)
+
                 ext = "tmp"
                 if img is not None and hasattr(img, 'format') and img.format:
                     ext = str(img.format).lower()
+                if ext == "wmf" and b"EMF" in header:
+                    ext = "emf"
 
                 if isinstance(source, (bytes, bytearray)):
                     in_path = os.path.join(tmpdir, f"input.{ext}")
@@ -454,34 +463,40 @@ class TableRecognizerONNX:
                     in_path = str(source)
                     
                 out_path = os.path.join(tmpdir, "output.png")
+                
+                cmds = [
+                    ["magick", "-density", "300", in_path, out_path],
+                    ["convert", "-density", "300", in_path, out_path],
+                    ["inkscape", in_path, "--export-type=png", f"--export-filename={out_path}", "--export-dpi=300", "--export-background=white"],
+                    ["soffice", "--headless", "--convert-to", "png", "--outdir", tmpdir, in_path]
+                ]
+                
                 success = False
                 last_err = ""
-                for cmd in ["magick", "convert"]:
+                for cmd in cmds:
                     try:
                         subprocess.run(
-                            [cmd, "-density", "300", in_path, out_path],
-                            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                            cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
                         )
                         success = True
                         break
                     except subprocess.CalledProcessError as cpe:
-                        last_err = cpe.stderr.strip()
+                        last_err = f"{cmd[0]} failed: {cpe.stderr.strip()}"
                         continue
                     except FileNotFoundError:
                         continue
                 
-                if not success:
-                    err_msg = f"ImageMagick fallback failed. Pillow err: {e}."
+                final_path = None
+                for candidate in [out_path, os.path.join(tmpdir, "output-0.png"), os.path.join(tmpdir, f"input.png")]:
+                    if os.path.exists(candidate):
+                        final_path = candidate
+                        break
+
+                if not final_path:
+                    err_msg = f"Vector fallback failed. Pillow err: {e}."
                     if last_err:
-                        err_msg += f" ImageMagick err: {last_err}"
+                        err_msg += f" Last tool err: {last_err}"
                     raise ValueError(err_msg)
-                
-                if os.path.exists(out_path):
-                    final_path = out_path
-                elif os.path.exists(os.path.join(tmpdir, "output-0.png")):
-                    final_path = os.path.join(tmpdir, "output-0.png")
-                else:
-                    raise ValueError(f"ImageMagick fallback produced no output. Original error: {e}")
                     
                 with Image.open(final_path) as tmp_img:
                     rgb_arr = np.asarray(tmp_img.convert("RGB"))
