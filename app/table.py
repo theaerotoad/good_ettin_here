@@ -77,9 +77,12 @@ class TableRecognizerONNX:
         if table_model_path:
             candidates.append(table_model_path)
 
+        home = os.path.expanduser("~")
         candidates.extend([
             "./table_model/ch_ppstructure_mobile_v2_SLANet.onnx",
             "./table_model/slanet.onnx",
+            os.path.join(home, ".rapid_table", "ch_ppstructure_mobile_v2_SLANet.onnx"),
+            os.path.join(home, ".cache", "rapid_table", "ch_ppstructure_mobile_v2_SLANet.onnx"),
             "./model/ch_ppstructure_mobile_v2_SLANet.onnx",
             "./model/slanet.onnx",
             "./model/table/ch_ppstructure_mobile_v2_SLANet.onnx",
@@ -89,8 +92,8 @@ class TableRecognizerONNX:
             if cand and os.path.exists(cand):
                 return cand
 
-        # Check table_model directory for any .onnx file
-        for search_dir in ["./table_model", "./model/table", "./model"]:
+        # Check local directories for any SLANet/Table ONNX model
+        for search_dir in ["./table_model", "./model/table", "./model", os.path.join(home, ".rapid_table")]:
             if os.path.isdir(search_dir):
                 for root, _, files in os.walk(search_dir):
                     for file in files:
@@ -149,7 +152,10 @@ class TableRecognizerONNX:
             self.session = None
 
     def _extract_ocr_tokens(self, img_bgr: np.ndarray) -> list[dict]:
-        """Extracts text tokens and bounding boxes from image using Pytesseract."""
+        """
+        Extracts high-precision text tokens and bounding boxes from table image
+        using multi-scale Pytesseract preprocessing to preserve decimal points and small numbers.
+        """
         if not self.use_tesseract:
             return []
 
@@ -158,8 +164,21 @@ class TableRecognizerONNX:
             import cv2
             import pytesseract
 
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            data = pytesseract.image_to_data(img_rgb, output_type=pytesseract.Output.DICT)
+            h, w = img_bgr.shape[:2]
+            scale_factor = max(1.0, 1400.0 / max(h, w)) if max(h, w) < 1400 else 1.0
+
+            if scale_factor > 1.0:
+                new_w = int(round(w * scale_factor))
+                new_h = int(round(h * scale_factor))
+                scaled_bgr = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+            else:
+                scaled_bgr = img_bgr
+
+            img_rgb = cv2.cvtColor(scaled_bgr, cv2.COLOR_BGR2RGB)
+
+            # PSM 6: Assume a single uniform block of text
+            custom_config = r"--psm 6"
+            data = pytesseract.image_to_data(img_rgb, output_type=pytesseract.Output.DICT, config=custom_config)
             n_boxes = len(data.get("text", []))
 
             for i in range(n_boxes):
@@ -167,19 +186,28 @@ class TableRecognizerONNX:
                 if not text_str:
                     continue
 
-                x = float(data["left"][i])
-                y = float(data["top"][i])
-                w = float(data["width"][i])
-                h = float(data["height"][i])
-
-                if w <= 0 or h <= 0:
+                conf = float(data.get("conf", [100])[i])
+                if conf < 0:
                     continue
 
-                x1, y1, x2, y2 = x, y, x + w, y + h
+                x = float(data["left"][i]) / scale_factor
+                y = float(data["top"][i]) / scale_factor
+                bw = float(data["width"][i]) / scale_factor
+                bh = float(data["height"][i]) / scale_factor
+
+                if bw <= 0 or bh <= 0:
+                    continue
+
+                x1, y1, x2, y2 = x, y, x + bw, y + bh
+
+                # Cleanup minor spacing artifacts after punctuation
+                import re
+                text_clean = re.sub(r'([.,:;!?])([A-Za-z])', r'\1 \2', text_str)
+
                 toks.append({
                     "bbox": [x1, y1, x2, y2],
                     "center": ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
-                    "text": text_str,
+                    "text": text_clean,
                 })
         except Exception as e:
             logger.debug(f"Pytesseract table OCR failed: {e}")
@@ -255,16 +283,20 @@ class TableRecognizerONNX:
             img_tensor = self._preprocess_slanet(img_bgr)
             outputs = self.session.run(None, {self.input_name: img_tensor})
 
-            # Identify structure_probs (3D, last dim ~41) and loc_preds (3D, last dim == 4)
             structure_probs = None
             loc_preds = None
 
             for out in outputs:
-                if out.ndim == 3:
-                    if out.shape[-1] == 4:
-                        loc_preds = out[0]
-                    else:
-                        structure_probs = out[0]
+                arr = np.squeeze(out)
+                if arr.ndim == 2:
+                    if arr.shape[0] == 4 and arr.shape[1] > 4:
+                        loc_preds = arr.T
+                    elif arr.shape[1] == 4:
+                        loc_preds = arr
+                    elif arr.shape[0] in (30, 40, 41) and arr.shape[1] > 41:
+                        structure_probs = arr.T
+                    elif arr.shape[1] in (30, 40, 41):
+                        structure_probs = arr
 
             if structure_probs is None:
                 return pred_structures, pred_bboxes
@@ -282,18 +314,16 @@ class TableRecognizerONNX:
                 if token in ("beg", "sos"):
                     continue
 
-                if token in ("<td>", "<td></td>", "<td", "<th>", "<th></th>", "<th") and loc_preds is not None:
+                if token in ("<td>", "<td></td>", "<td", "<th>", "<th></th>", "<th") and loc_preds is not None and t < len(loc_preds):
                     bbox = loc_preds[t]
-                    # Rescale if output is in 488px space vs [0, 1] normalized
-                    if np.max(bbox) > 1.5:
-                        bx1, by1, bx2, by2 = bbox[0] / 488.0, bbox[1] / 488.0, bbox[2] / 488.0, bbox[3] / 488.0
-                    else:
-                        bx1, by1, bx2, by2 = bbox[0], bbox[1], bbox[2], bbox[3]
+                    bx1, by1, bx2, by2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+                    if max(bx1, by1, bx2, by2) > 1.5:
+                        bx1, by1, bx2, by2 = bx1 / 488.0, by1 / 488.0, bx2 / 488.0, by2 / 488.0
 
-                    real_x1 = max(0.0, min(float(w), float(bx1 * w)))
-                    real_y1 = max(0.0, min(float(h), float(by1 * h)))
-                    real_x2 = max(0.0, min(float(w), float(bx2 * w)))
-                    real_y2 = max(0.0, min(float(h), float(by2 * h)))
+                    real_x1 = max(0.0, min(float(w), bx1 * w))
+                    real_y1 = max(0.0, min(float(h), by1 * h))
+                    real_x2 = max(0.0, min(float(w), bx2 * w))
+                    real_y2 = max(0.0, min(float(h), by2 * h))
                     pred_bboxes.append([real_x1, real_y1, real_x2, real_y2])
 
                 pred_structures.append(token)
@@ -306,16 +336,14 @@ class TableRecognizerONNX:
         return pred_structures, pred_bboxes
 
     def _match_cells_and_build_html(
-        self, pred_structures: list, pred_bboxes: list, ocr_tokens: list[dict]
+        self, pred_structures: list, pred_bboxes: list, ocr_tokens: list[dict], img_bgr: np.ndarray = None
     ) -> str:
         """Matches OCR tokens to SLANet cell coordinates and reconstructs full HTML table."""
-        # Standardize cell bounding boxes to [[x1, y1, x2, y2], ...]. Append None to maintain index alignment!
         cell_boxes = []
         if pred_bboxes is not None and not isinstance(pred_bboxes, (int, float)):
             for b in pred_bboxes:
                 cell_boxes.append(self._normalize_box(b))
 
-        # Map each OCR token to its best overlapping or enclosing cell box
         cell_to_tokens = {i: [] for i in range(len(cell_boxes))}
         for token in ocr_tokens:
             cx, cy = token["center"]
@@ -328,11 +356,11 @@ class TableRecognizerONNX:
             for c_idx, norm_b in enumerate(cell_boxes):
                 if norm_b is None:
                     continue
-                    
+
                 bx1, by1, bx2, by2 = norm_b
-                
-                # 1. Point-in-box check (with 3px tolerance)
-                if (bx1 - 3.0) <= cx <= (bx2 + 3.0) and (by1 - 3.0) <= cy <= (by2 + 3.0):
+
+                # 1. Point-in-box check (with 4px tolerance)
+                if (bx1 - 4.0) <= cx <= (bx2 + 4.0) and (by1 - 4.0) <= cy <= (by2 + 4.0):
                     matched_idx = c_idx
                     break
 
@@ -351,11 +379,27 @@ class TableRecognizerONNX:
             if matched_idx is not None:
                 cell_to_tokens[matched_idx].append(token)
 
-        # Sort tokens in each cell top-to-bottom, left-to-right and join
         cell_texts = {}
         for c_idx, tokens in cell_to_tokens.items():
-            tokens.sort(key=lambda t: (t["bbox"][1], t["bbox"][0]))
-            cell_texts[c_idx] = " ".join(t["text"] for t in tokens)
+            tokens.sort(key=lambda t: (int(t["bbox"][1] / 10.0), t["bbox"][0]))
+            cell_texts[c_idx] = " ".join(t["text"] for t in tokens).strip()
+
+        # Cell OCR fallback for empty cells
+        if self.use_tesseract and img_bgr is not None:
+            import pytesseract
+            import cv2
+            h, w = img_bgr.shape[:2]
+            for c_idx, norm_b in enumerate(cell_boxes):
+                if not cell_texts.get(c_idx) and norm_b is not None:
+                    bx1, by1, bx2, by2 = norm_b
+                    cx1, cy1 = max(0, int(bx1) - 1), max(0, int(by1) - 1)
+                    cx2, cy2 = min(w, int(bx2) + 1), min(h, int(by2) + 1)
+                    if (cx2 - cx1) > 8 and (cy2 - cy1) > 8:
+                        crop = img_bgr[cy1:cy2, cx1:cx2]
+                        crop_scaled = cv2.resize(crop, ((cx2 - cx1) * 3, (cy2 - cy1) * 3), interpolation=cv2.INTER_CUBIC)
+                        txt = pytesseract.image_to_string(cv2.cvtColor(crop_scaled, cv2.COLOR_BGR2RGB), config="--psm 7").strip()
+                        if txt:
+                            cell_texts[c_idx] = txt
 
         # Assemble HTML table using pred_structures tokens with cell text injection
         if isinstance(pred_structures, (list, tuple)) and pred_structures:
@@ -397,6 +441,8 @@ class TableRecognizerONNX:
                     text_val = cell_texts.get(cell_idx, "")
                     cell_idx += 1
                     html_tokens.append(f"<{cell_tag}>{text_val}</{cell_tag}>")
+                elif tag_lower in ("</td>", "</th>"):
+                    i += 1
                 else:
                     html_tokens.append(tag)
                     i += 1
@@ -605,7 +651,7 @@ class TableRecognizerONNX:
             pred_structures, pred_bboxes = self._extract_slanet_structure(img_bgr)
 
             # 3. Match cells and construct HTML table
-            html_str = self._match_cells_and_build_html(pred_structures, pred_bboxes, ocr_tokens)
+            html_str = self._match_cells_and_build_html(pred_structures, pred_bboxes, ocr_tokens, img_bgr=img_bgr)
 
             # 4. Convert HTML table to Markdown
             markdown_str = html_table_to_markdown(html_str)
