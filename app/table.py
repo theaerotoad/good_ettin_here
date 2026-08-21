@@ -276,6 +276,7 @@ class TableRecognizerONNX:
         pred_bboxes = []
 
         if self.session is None:
+            logger.warning("SLANet ONNX session is None. Skipping neural table extraction.")
             return pred_structures, pred_bboxes
 
         try:
@@ -289,16 +290,17 @@ class TableRecognizerONNX:
             for out in outputs:
                 arr = np.squeeze(out)
                 if arr.ndim == 2:
-                    if arr.shape[0] == 4 and arr.shape[1] > 4:
-                        loc_preds = arr.T
-                    elif arr.shape[1] == 4:
+                    if arr.shape[1] == 4:
                         loc_preds = arr
-                    elif arr.shape[0] in (30, 40, 41) and arr.shape[1] > 41:
-                        structure_probs = arr.T
-                    elif arr.shape[1] in (30, 40, 41):
+                    elif arr.shape[0] == 4:
+                        loc_preds = arr.T
+                    elif arr.shape[1] in (30, 39, 40, 41, 42):
                         structure_probs = arr
+                    elif arr.shape[0] in (30, 39, 40, 41, 42):
+                        structure_probs = arr.T
 
             if structure_probs is None:
+                logger.warning(f"Could not identify structure_probs from ONNX output shapes: {[o.shape for o in outputs]}")
                 return pred_structures, pred_bboxes
 
             pred_token_indices = np.argmax(structure_probs, axis=-1)
@@ -330,8 +332,9 @@ class TableRecognizerONNX:
                 if token == "</html>":
                     break
 
+            logger.info(f"SLANet extracted {len(pred_structures)} structure tokens and {len(pred_bboxes)} cell bboxes.")
         except Exception as e:
-            logger.warning(f"Native SLANet inference failed: {e}")
+            logger.exception(f"Native SLANet inference failed: {e}")
 
         return pred_structures, pred_bboxes
 
@@ -458,6 +461,7 @@ class TableRecognizerONNX:
 
         # Fallback: if SLANet output was empty, invalid, or we couldn't map any text, build table rows directly from clustered OCR tokens
         if (not html_output or "<table" not in html_output.lower() or not has_text) and ocr_tokens:
+            logger.warning("SLANet structure generation failed or returned no text. Triggering OCR geometric clustering fallback.")
             sorted_ocr = sorted(ocr_tokens, key=lambda t: t["bbox"][1])
             rows = []
             curr_row = []
@@ -476,16 +480,36 @@ class TableRecognizerONNX:
                 curr_row.sort(key=lambda item: item["bbox"][0])
                 rows.append(curr_row)
 
-            # Cluster columns based on x-coordinates
+            # Merge horizontally adjacent words on the same line before column clustering
+            for row in rows:
+                merged_row = []
+                idx = 0
+                while idx < len(row):
+                    cur = dict(row[idx])
+                    while idx + 1 < len(row):
+                        nxt = row[idx + 1]
+                        gap = nxt["bbox"][0] - cur["bbox"][2]
+                        # If words are separated by normal space (< 15px), merge into single cell
+                        if 0 <= gap < 15.0:
+                            cur["text"] = f"{cur['text']} {nxt['text']}"
+                            cur["bbox"][2] = nxt["bbox"][2]
+                            cur["center"] = ((cur["bbox"][0] + cur["bbox"][2]) / 2.0, (cur["bbox"][1] + cur["bbox"][3]) / 2.0)
+                            idx += 1
+                        else:
+                            break
+                    merged_row.append(cur)
+                    idx += 1
+                row[:] = merged_row
+
+            # Cluster columns based on merged bounding box centers
             all_x = [t["center"][0] for row in rows for t in row]
             all_x.sort()
-            
+
             cols = []
             if all_x:
                 curr_c = [all_x[0]]
                 for x in all_x[1:]:
-                    # 25px threshold to group items into the same column
-                    if x - (sum(curr_c) / len(curr_c)) < 25.0:
+                    if x - (sum(curr_c) / len(curr_c)) < 35.0:
                         curr_c.append(x)
                     else:
                         cols.append(sum(curr_c) / len(curr_c))
@@ -499,23 +523,15 @@ class TableRecognizerONNX:
                 col_idx = 0
                 for t in row:
                     cx = t["center"][0]
-                    # Find closest column
                     best_c = min(range(len(cols)), key=lambda i: abs(cols[i] - cx))
-                    
-                    # Fill with empty cells if we skipped columns (e.g., indentation)
                     while col_idx < best_c:
                         row_tds.append("<td></td>")
                         col_idx += 1
-                        
                     row_tds.append(f"<td>{t['text']}</td>")
-                    # Advance col_idx to prevent overwriting if multiple tokens share a column
                     col_idx = max(col_idx + 1, best_c + 1)
-                    
-                # Fill remaining columns
                 while col_idx < len(cols):
                     row_tds.append("<td></td>")
                     col_idx += 1
-                    
                 table_rows_html.append(f"<tr>{''.join(row_tds)}</tr>")
             html_output = f"<table>{''.join(table_rows_html)}</table>"
 
