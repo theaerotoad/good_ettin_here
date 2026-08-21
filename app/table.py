@@ -10,152 +10,181 @@ logger = logging.getLogger("ettin-reranker")
 
 class TableRecognizerONNX:
     """
-    ONNX-based Table Structure Recognizer using RapidTable (SLANet) and RapidOCR.
-    Combines SLANet cell bounding boxes with OCR tokens to construct HTML & Markdown tables.
+    Pure ONNX-based Table Structure Recognizer using SLANet.
+    Decodes table structure HTML tags and cell bounding boxes natively without
+    rapid-table or rapidocr dependencies.
     """
 
+    # 41-token SLANet / PP-Structure table structure vocabulary
+    VOCAB = [
+        "beg",
+        "end",
+        "<html>",
+        "<body>",
+        "<table>",
+        "<thead>",
+        "<tbody>",
+        "<tr>",
+        "<td>",
+        "<td",
+        ">",
+        "</td>",
+        "<th>",
+        "<th",
+        "</th>",
+        "</tr>",
+        "</thead>",
+        "</tbody>",
+        "</table>",
+        "</body>",
+        "</html>",
+        'colspan="2"',
+        'colspan="3"',
+        'colspan="4"',
+        'colspan="5"',
+        'colspan="6"',
+        'colspan="7"',
+        'colspan="8"',
+        'colspan="9"',
+        'colspan="10"',
+        'rowspan="2"',
+        'rowspan="3"',
+        'rowspan="4"',
+        'rowspan="5"',
+        'rowspan="6"',
+        'rowspan="7"',
+        'rowspan="8"',
+        'rowspan="9"',
+        'rowspan="10"',
+        "<td></td>",
+        "<th></th>",
+    ]
+
+    INPUT_SHAPE = (488, 488)
+    MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
     def __init__(self, table_model_path: str = None, use_gpu: bool = False):
-        self.table_engine = None
-        self.ocr_engine = None
+        self.session = None
+        self.input_name = None
+        self.output_names = []
+        self.use_tesseract = False
         self._init_engines(table_model_path, use_gpu)
+
+    def _find_or_download_model(self, table_model_path: str = None) -> str:
+        """Locates the SLANet ONNX model file or downloads it automatically if missing."""
+        candidates = []
+        if table_model_path:
+            candidates.append(table_model_path)
+
+        candidates.extend([
+            "./table_model/ch_ppstructure_mobile_v2_SLANet.onnx",
+            "./table_model/slanet.onnx",
+            "./model/ch_ppstructure_mobile_v2_SLANet.onnx",
+            "./model/slanet.onnx",
+            "./model/table/ch_ppstructure_mobile_v2_SLANet.onnx",
+        ])
+
+        for cand in candidates:
+            if cand and os.path.exists(cand):
+                return cand
+
+        # Check table_model directory for any .onnx file
+        for search_dir in ["./table_model", "./model/table", "./model"]:
+            if os.path.isdir(search_dir):
+                for root, _, files in os.walk(search_dir):
+                    for file in files:
+                        if file.endswith(".onnx") and ("slanet" in file.lower() or "table" in file.lower()):
+                            return os.path.join(root, file)
+
+        # Automatic fallback download if no local weights exist
+        target_path = "./table_model/ch_ppstructure_mobile_v2_SLANet.onnx"
+        try:
+            import urllib.request
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            url = "https://huggingface.co/SWHL/RapidStructure/resolve/main/table/ch_ppstructure_mobile_v2_SLANet.onnx"
+            logger.info(f"Downloading SLANet ONNX weights from {url} to {target_path}...")
+            urllib.request.urlretrieve(url, target_path)
+            logger.info("SLANet weights downloaded successfully.")
+            return target_path
+        except Exception as e:
+            logger.warning(f"Could not auto-download SLANet model: {e}")
+
+        return None
 
     def _init_engines(self, table_model_path: str = None, use_gpu: bool = False):
         try:
-            from rapidocr_onnxruntime import RapidOCR
-        except ImportError:
-            try:
-                from rapidocr import RapidOCR
-            except ImportError:
-                RapidOCR = None
+            import pytesseract
+            pytesseract.get_tesseract_version()
+            self.use_tesseract = True
+            logger.info("Initialized Pytesseract OCR engine for table text recognition.")
+        except Exception:
+            logger.info("Pytesseract not found or tesseract binary missing. Cell text OCR will use heuristic clustering.")
 
-        try:
-            from rapid_table import RapidTable
-        except ImportError:
-            RapidTable = None
-
-        if RapidTable is None:
+        model_path = self._find_or_download_model(table_model_path)
+        if not model_path or not os.path.exists(model_path):
             logger.warning(
-                "rapid-table not installed. Table structure recognition disabled. "
-                "Install via: pip install rapid-table rapidocr-onnxruntime beautifulsoup4"
+                f"SLANet ONNX model not found. Checked: {table_model_path}. "
+                "Download weights with: curl -L https://huggingface.co/SWHL/RapidStructure/resolve/main/table/ch_ppstructure_mobile_v2_SLANet.onnx -o table_model/ch_ppstructure_mobile_v2_SLANet.onnx"
             )
             return
 
-        if RapidOCR is not None:
-            try:
-                ocr_params = {}
-                if use_gpu:
-                    ocr_params["use_cuda"] = True
-                self.ocr_engine = RapidOCR(**ocr_params)
-                logger.info("Initialized RapidOCR engine for table text recognition.")
-            except Exception as e:
-                logger.warning(f"Could not initialize RapidOCR: {e}")
-                self.ocr_engine = None
-
         try:
-            table_params = {}
-            if table_model_path and os.path.exists(table_model_path):
-                table_params["model_path"] = table_model_path
-            if use_gpu:
-                table_params["use_cuda"] = True
-            self.table_engine = RapidTable(**table_params)
-            logger.info("Initialized RapidTable SLANet engine for table structure extraction.")
+            import onnxruntime as ort
+            available_providers = ort.get_available_providers()
+            providers = []
+            if use_gpu and "CUDAExecutionProvider" in available_providers:
+                providers.append("CUDAExecutionProvider")
+            providers.append("CPUExecutionProvider")
+
+            sess_options = ort.SessionOptions()
+            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+            self.session = ort.InferenceSession(model_path, sess_options, providers=providers)
+            self.input_name = self.session.get_inputs()[0].name
+            self.output_names = [out.name for out in self.session.get_outputs()]
+            logger.info(f"Initialized native SLANet ONNX session from {model_path} with providers: {providers}")
         except Exception as e:
-            logger.warning(f"Could not initialize RapidTable: {e}")
-            self.table_engine = None
+            logger.warning(f"Could not initialize SLANet ONNX session: {e}")
+            self.session = None
 
     def _extract_ocr_tokens(self, img_bgr: np.ndarray) -> list[dict]:
-        """Runs 2-pass OCR (normal + negated) on image crop and returns deduplicated text boxes."""
-        if self.ocr_engine is None:
+        """Extracts text tokens and bounding boxes from image using Pytesseract."""
+        if not self.use_tesseract:
             return []
 
-        def run_pass(img_array):
-            toks = []
-            try:
-                ocr_out = self.ocr_engine(img_array)
-                raw_boxes = ocr_out[0] if isinstance(ocr_out, (list, tuple)) and len(ocr_out) > 0 else ocr_out
-                if not raw_boxes or not isinstance(raw_boxes, list):
-                    return toks
+        toks = []
+        try:
+            import cv2
+            import pytesseract
 
-                for item in raw_boxes:
-                    if not item or len(item) < 2:
-                        continue
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            data = pytesseract.image_to_data(img_rgb, output_type=pytesseract.Output.DICT)
+            n_boxes = len(data.get("text", []))
 
-                    box_pts = item[0]
-                    text_val = item[1]
-                    text_str = str(text_val[0]) if isinstance(text_val, (list, tuple)) else str(text_val)
-                    text_str = text_str.strip()
-                    if not text_str:
-                        continue
+            for i in range(n_boxes):
+                text_str = str(data["text"][i]).strip()
+                if not text_str:
+                    continue
 
-                    pts = np.asarray(box_pts)
-                    if pts.ndim == 2 and len(pts) >= 4:
-                        x1 = float(np.min(pts[:, 0]))
-                        y1 = float(np.min(pts[:, 1]))
-                        x2 = float(np.max(pts[:, 0]))
-                        y2 = float(np.max(pts[:, 1]))
-                    elif len(box_pts) == 4 and not isinstance(box_pts[0], (list, tuple, np.ndarray)):
-                        x1, y1, x2, y2 = float(box_pts[0]), float(box_pts[1]), float(box_pts[2]), float(box_pts[3])
-                    else:
-                        continue
+                x = float(data["left"][i])
+                y = float(data["top"][i])
+                w = float(data["width"][i])
+                h = float(data["height"][i])
 
-                    # Heuristic cleanup for missing spaces
-                    import re
-                    text_clean = re.sub(r'([.,:;!?])([A-Za-z])', r'\1 \2', text_str)
-                    text_clean = re.sub(r'([a-z])([A-Z])', r'\1 \2', text_clean)
+                if w <= 0 or h <= 0:
+                    continue
 
-                    toks.append({
-                        "bbox": [x1, y1, x2, y2],
-                        "center": ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
-                        "text": text_clean,
-                    })
-            except Exception as e:
-                logger.debug(f"OCR pass failed: {e}")
-            return toks
+                x1, y1, x2, y2 = x, y, x + w, y + h
+                toks.append({
+                    "bbox": [x1, y1, x2, y2],
+                    "center": ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
+                    "text": text_str,
+                })
+        except Exception as e:
+            logger.debug(f"Pytesseract table OCR failed: {e}")
 
-        # Heuristic to skip unnecessary OCR passes based on crop polarity
-        gray = np.dot(img_bgr[..., :3], [0.114, 0.587, 0.299])
-        total_px = gray.size
-        run_normal = True
-        run_negated = True
-
-        if total_px > 0:
-            light_pct = np.sum(gray > 170) / total_px
-            dark_pct = np.sum(gray < 85) / total_px
-            if light_pct > 0.85:
-                run_negated = False
-            elif dark_pct > 0.85:
-                run_normal = False
-
-        normal_tokens = run_pass(img_bgr) if run_normal else []
-        negated_tokens = run_pass(255 - img_bgr) if run_negated else []
-
-        # Merge and deduplicate tokens (Intersection over Min Area)
-        ocr_tokens = list(normal_tokens)
-        for n_tok in negated_tokens:
-            is_dup = False
-            nx1, ny1, nx2, ny2 = n_tok["bbox"]
-            n_area = max(0, nx2 - nx1) * max(0, ny2 - ny1)
-
-            for m_tok in ocr_tokens:
-                mx1, my1, mx2, my2 = m_tok["bbox"]
-                m_area = max(0, mx2 - mx1) * max(0, my2 - my1)
-
-                ix1, iy1 = max(nx1, mx1), max(ny1, my1)
-                ix2, iy2 = min(nx2, mx2), min(ny2, my2)
-                inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
-
-                # If the overlap is significant relative to the smaller bounding box
-                if inter / (min(n_area, m_area) + 1e-9) > 0.4:
-                    is_dup = True
-                    # Favor the longer string (cleaner OCR read on high contrast)
-                    if len(n_tok["text"]) > len(m_tok["text"]) + 2:
-                        m_tok["text"] = n_tok["text"]
-                    break
-
-            if not is_dup:
-                ocr_tokens.append(n_tok)
-
-        return ocr_tokens
+        return toks
 
     @staticmethod
     def _normalize_box(b) -> list[float]:
@@ -204,69 +233,75 @@ class TableRecognizerONNX:
             pass
         return None
 
+    def _preprocess_slanet(self, img_bgr: np.ndarray) -> np.ndarray:
+        """Prepares input image for SLANet: resize to (488, 488) and standard ImageNet normalize."""
+        import cv2
+        resized = cv2.resize(img_bgr, self.INPUT_SHAPE, interpolation=cv2.INTER_LINEAR)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        normalized = (rgb - self.MEAN) / self.STD
+        tensor = np.transpose(normalized, (2, 0, 1))  # HWC -> CHW
+        return np.expand_dims(tensor, axis=0).astype(np.float32)
+
     def _extract_slanet_structure(self, img_bgr: np.ndarray) -> tuple[list, list]:
-        """Extracts HTML tags and cell bounding boxes using SLANet ONNX engine."""
+        """Runs native SLANet ONNX inference and decodes HTML structure tokens and cell bboxes."""
         pred_structures = []
         pred_bboxes = []
 
-        if self.table_engine is None:
+        if self.session is None:
             return pred_structures, pred_bboxes
 
-        raw_struct = None
+        try:
+            h, w = img_bgr.shape[:2]
+            img_tensor = self._preprocess_slanet(img_bgr)
+            outputs = self.session.run(None, {self.input_name: img_tensor})
 
-        # 1. Try to bypass RapidTable's internal OCR wrapper by accessing the core SLANet model directly
-        for attr in ["table_model", "table_structure", "structure_model", "model"]:
-            if hasattr(self.table_engine, attr):
-                internal_model = getattr(self.table_engine, attr)
-                if callable(internal_model):
-                    try:
-                        raw_struct = internal_model(img_bgr)
-                        if raw_struct is not None:
-                            break
-                    except Exception as e:
-                        logger.warning(f"Internal model '{attr}' call failed: {e}")
+            # Identify structure_probs (3D, last dim ~41) and loc_preds (3D, last dim == 4)
+            structure_probs = None
+            loc_preds = None
 
-        # 2. Fallback to direct call on table_engine
-        if raw_struct is None:
-            try:
-                raw_struct = self.table_engine(img_bgr)
-            except Exception as e:
-                logger.warning(f"SLANet direct call failed: {e}")
+            for out in outputs:
+                if out.ndim == 3:
+                    if out.shape[-1] == 4:
+                        loc_preds = out[0]
+                    else:
+                        structure_probs = out[0]
 
-        if raw_struct is None:
-            return pred_structures, pred_bboxes
+            if structure_probs is None:
+                return pred_structures, pred_bboxes
 
-        # 3. Robust unpacking: Find structures (strings/tags) and bboxes (coords) dynamically
-        candidates = []
-        if isinstance(raw_struct, (list, tuple)):
-            for item in raw_struct:
-                if isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[0], (list, tuple)):
-                    candidates.extend([item[0], item[1]])
-                else:
-                    candidates.append(item)
-        else:
-            candidates = [raw_struct]
+            pred_token_indices = np.argmax(structure_probs, axis=-1)
 
-        for cand in candidates:
-            if isinstance(cand, (list, tuple, np.ndarray)) and len(cand) > 0:
-                # Check if it contains structure tags
-                if isinstance(cand[0], str) or (isinstance(cand[0], dict) and "tag" in cand[0]):
-                    pred_structures = cand
-                # Check if it contains numeric bounding boxes
-                elif isinstance(cand[0], (list, tuple, np.ndarray)) and len(cand[0]) >= 2:
-                    if not isinstance(cand[0][0], str):
-                        pred_bboxes = cand
+            for t in range(len(pred_token_indices)):
+                idx = int(pred_token_indices[t])
+                if idx >= len(self.VOCAB):
+                    continue
 
-        if not pred_structures and isinstance(raw_struct, str):
-            pred_structures = raw_struct
+                token = self.VOCAB[idx]
+                if token in ("end", "eos"):
+                    break
+                if token in ("beg", "sos"):
+                    continue
 
-        # Unwrap batch dimension if present
-        if isinstance(pred_structures, list) and len(pred_structures) == 1 and isinstance(pred_structures[0], list):
-            pred_structures = pred_structures[0]
-        if isinstance(pred_bboxes, list) and len(pred_bboxes) == 1 and isinstance(pred_bboxes[0], (list, np.ndarray)):
-            pred_bboxes = pred_bboxes[0]
-        elif isinstance(pred_bboxes, np.ndarray) and pred_bboxes.ndim >= 3 and pred_bboxes.shape[0] == 1:
-            pred_bboxes = pred_bboxes[0]
+                if token in ("<td>", "<td></td>", "<td", "<th>", "<th></th>", "<th") and loc_preds is not None:
+                    bbox = loc_preds[t]
+                    # Rescale if output is in 488px space vs [0, 1] normalized
+                    if np.max(bbox) > 1.5:
+                        bx1, by1, bx2, by2 = bbox[0] / 488.0, bbox[1] / 488.0, bbox[2] / 488.0, bbox[3] / 488.0
+                    else:
+                        bx1, by1, bx2, by2 = bbox[0], bbox[1], bbox[2], bbox[3]
+
+                    real_x1 = max(0.0, min(float(w), float(bx1 * w)))
+                    real_y1 = max(0.0, min(float(h), float(by1 * h)))
+                    real_x2 = max(0.0, min(float(w), float(bx2 * w)))
+                    real_y2 = max(0.0, min(float(h), float(by2 * h)))
+                    pred_bboxes.append([real_x1, real_y1, real_x2, real_y2])
+
+                pred_structures.append(token)
+                if token == "</html>":
+                    break
+
+        except Exception as e:
+            logger.warning(f"Native SLANet inference failed: {e}")
 
         return pred_structures, pred_bboxes
 
@@ -322,35 +357,49 @@ class TableRecognizerONNX:
             tokens.sort(key=lambda t: (t["bbox"][1], t["bbox"][0]))
             cell_texts[c_idx] = " ".join(t["text"] for t in tokens)
 
-        # Assemble HTML table using pred_structures tokens
+        # Assemble HTML table using pred_structures tokens with cell text injection
         if isinstance(pred_structures, (list, tuple)) and pred_structures:
             html_tokens = []
             cell_idx = 0
-            for item in pred_structures:
-                if isinstance(item, (list, tuple)):
-                    tag = str(item[0]) if len(item) > 0 else ""
-                elif isinstance(item, dict):
-                    tag = str(item.get("tag", item.get("text", "")))
-                else:
-                    tag = str(item) if item is not None else ""
-
-                if not tag:
-                    continue
-
+            i = 0
+            n = len(pred_structures)
+            while i < n:
+                item = pred_structures[i]
+                tag = str(item[0]) if isinstance(item, (list, tuple)) and len(item) > 0 else str(item)
                 tag_lower = tag.lower().strip()
-                if tag_lower.startswith("<td") or tag_lower.startswith("<th"):
+
+                if tag_lower in ("<td></td>", "<th></th>"):
+                    cell_tag = "td" if "td" in tag_lower else "th"
                     text_val = cell_texts.get(cell_idx, "")
                     cell_idx += 1
-                    if tag_lower.endswith("</td>"):
-                        tag_open = tag[: -len("</td>")]
-                        html_tokens.append(f"{tag_open}{text_val}</td>")
-                    elif tag_lower.endswith("</th>"):
-                        tag_open = tag[: -len("</th>")]
-                        html_tokens.append(f"{tag_open}{text_val}</th>")
-                    else:
-                        html_tokens.append(f"{tag}{text_val}")
+                    html_tokens.append(f"<{cell_tag}>{text_val}</{cell_tag}>")
+                    i += 1
+                elif tag_lower in ("<td", "<th"):
+                    cell_tag = "td" if "td" in tag_lower else "th"
+                    attrs = []
+                    i += 1
+                    while i < n and pred_structures[i].strip() != ">":
+                        attrs.append(pred_structures[i].strip())
+                        i += 1
+                    if i < n and pred_structures[i].strip() == ">":
+                        i += 1
+                    if i < n and pred_structures[i].strip().lower() in ("</td>", "</th>"):
+                        i += 1
+                    attr_str = (" " + " ".join(attrs)) if attrs else ""
+                    text_val = cell_texts.get(cell_idx, "")
+                    cell_idx += 1
+                    html_tokens.append(f"<{cell_tag}{attr_str}>{text_val}</{cell_tag}>")
+                elif tag_lower in ("<td>", "<th>"):
+                    cell_tag = "td" if "td" in tag_lower else "th"
+                    i += 1
+                    if i < n and pred_structures[i].strip().lower() in ("</td>", "</th>"):
+                        i += 1
+                    text_val = cell_texts.get(cell_idx, "")
+                    cell_idx += 1
+                    html_tokens.append(f"<{cell_tag}>{text_val}</{cell_tag}>")
                 else:
                     html_tokens.append(tag)
+                    i += 1
 
             html_output = "".join(html_tokens)
         elif isinstance(pred_structures, str) and pred_structures:
@@ -503,7 +552,7 @@ class TableRecognizerONNX:
                     return rgb_arr[:, :, ::-1].copy()
 
     def extract(self, image_input) -> dict:
-        if self.table_engine is None and self.ocr_engine is None:
+        if self.session is None and not self.use_tesseract:
             return {"html": "", "markdown": ""}
 
         # Standardize input to OpenCV BGR numpy array

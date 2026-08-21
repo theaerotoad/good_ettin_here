@@ -73,13 +73,6 @@ class DocLayNetONNX:
             pass
 
         self.ocr_engine = None
-        if not self.use_tesseract:
-            try:
-                from rapidocr_onnxruntime import RapidOCR
-                self.ocr_engine = RapidOCR(use_cuda=use_gpu)
-                logger.info("Initialized RapidOCR engine for DocLayNet text extraction.")
-            except ImportError:
-                pass
 
         # 1. Load labels dynamically from config.json if present
         config_path = os.path.join(model_dir, "config.json")

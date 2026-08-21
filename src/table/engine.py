@@ -1,9 +1,11 @@
 """
-RapidTable / SLANet ONNX Table Recognizer Engine.
-Extracts tabular data from images using ONNX runtime and formats into HTML/Markdown.
+SLANet ONNX Table Recognizer Engine.
+Extracts tabular data from images using ONNX runtime and formats into HTML/Markdown
+with zero rapid-table or rapidocr dependencies.
 """
 
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -11,9 +13,8 @@ from typing import Any, Dict, List, Optional, Union
 import cv2
 import numpy as np
 from PIL import Image
-from rapid_table import RapidTable
-from rapidocr_onnxruntime import RapidOCR
 
+from app.table import TableRecognizerONNX
 from .converter import html_table_to_markdown
 
 
@@ -30,7 +31,7 @@ class TableResult:
 class TableRecognizer:
     """
     Extracts tabular structures and cell text from images using SLANet (ONNX)
-    and RapidOCR, with support for HTML and Markdown outputs.
+    with support for HTML and Markdown outputs.
     """
 
     def __init__(
@@ -40,27 +41,17 @@ class TableRecognizer:
         use_cuda: bool = False,
     ):
         """
-        Initialize RapidTable and RapidOCR engines.
+        Initialize SLANet ONNX engine.
 
         Args:
             table_model_path: Optional custom path to the SLANet ONNX model.
-            ocr_model_dir: Optional custom directory for OCR ONNX models.
+            ocr_model_dir: Deprecated / unused parameter kept for interface compatibility.
             use_cuda: Whether to use CUDA execution provider for ONNX runtime.
         """
-        table_kwargs: Dict[str, Any] = {}
-        if table_model_path:
-            table_kwargs["model_path"] = str(table_model_path)
-        if use_cuda:
-            table_kwargs["use_cuda"] = True
-
-        ocr_kwargs: Dict[str, Any] = {}
-        if ocr_model_dir:
-            ocr_kwargs["model_dir"] = str(ocr_model_dir)
-        if use_cuda:
-            ocr_kwargs["use_cuda"] = True
-
-        self.ocr_engine = RapidOCR(**ocr_kwargs)
-        self.table_engine = RapidTable(**table_kwargs)
+        self.recognizer = TableRecognizerONNX(
+            table_model_path=str(table_model_path) if table_model_path else None,
+            use_gpu=use_cuda,
+        )
 
     def _safe_load_bgr(self, source) -> np.ndarray:
         """Helper to load image via Pillow with ImageMagick fallback, then return BGR numpy array."""
@@ -173,7 +164,7 @@ class TableRecognizer:
         image: Union[str, Path, bytes, np.ndarray, Image.Image],
     ) -> TableResult:
         """
-        Performs OCR text recognition and SLANet structure extraction on the image.
+        Performs SLANet structure extraction and OCR cell matching on the image.
 
         Args:
             image: Image path, PIL Image, or OpenCV/numpy image array.
@@ -181,21 +172,14 @@ class TableRecognizer:
         Returns:
             TableResult containing HTML, Markdown, bounding boxes, and latency.
         """
-        img_bgr = self._prepare_image(image)
-
-        # 1. Run OCR on the full table image to locate text tokens
-        ocr_result, _ = self.ocr_engine(img_bgr)
-
-        # 2. Run SLANet Table Recognition via RapidTable
-        table_html_str, table_cell_bboxes, elapse = self.table_engine(img_bgr, ocr_result)
-
-        # 3. Convert generated HTML table structure to Markdown
-        markdown_str = html_table_to_markdown(table_html_str)
+        t0 = time.time()
+        res = self.recognizer.extract(image)
+        elapse = time.time() - t0
 
         return TableResult(
-            html=table_html_str,
-            markdown=markdown_str,
+            html=res.get("html", ""),
+            markdown=res.get("markdown", ""),
             elapse=elapse,
-            cell_bboxes=table_cell_bboxes,
-            raw_ocr_result=ocr_result,
+            cell_bboxes=[],
+            raw_ocr_result=[],
         )

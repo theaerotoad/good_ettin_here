@@ -379,12 +379,12 @@ def extract_table():
 
         if len(results) == 1:
             return jsonify({
-                "model": "rapid-table-slanet",
+                "model": "slanet-onnx",
                 "html": results[0]["html"],
                 "markdown": results[0]["markdown"],
             })
         return jsonify({
-            "model": "rapid-table-slanet",
+            "model": "slanet-onnx",
             "results": results,
         })
     except Exception as e:
