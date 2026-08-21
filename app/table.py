@@ -71,8 +71,25 @@ class TableRecognizerONNX:
         self.use_tesseract = False
         self._init_engines(table_model_path, use_gpu)
 
-    def _find_or_download_model(self, table_model_path: str = None) -> str:
-        """Locates the SLANet ONNX model file or downloads it automatically if missing."""
+    @staticmethod
+    def _is_valid_onnx_file(path: str) -> bool:
+        """Validates that a file exists, is non-empty (>100KB), and is not a Git LFS pointer."""
+        if not path or not os.path.isfile(path):
+            return False
+        try:
+            # Model weights are ~7MB; Git LFS text pointers or empty files are < 1KB
+            if os.path.getsize(path) < 100 * 1024:
+                return False
+            with open(path, "rb") as f:
+                header = f.read(64)
+                if b"version https://git-lfs" in header:
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def _get_candidate_model_paths(self, table_model_path: str = None) -> list[str]:
+        """Collects candidate paths for the SLANet ONNX model."""
         candidates = []
         if table_model_path:
             candidates.append(table_model_path)
@@ -88,32 +105,22 @@ class TableRecognizerONNX:
             "./model/table/ch_ppstructure_mobile_v2_SLANet.onnx",
         ])
 
-        for cand in candidates:
-            if cand and os.path.exists(cand):
-                return cand
-
-        # Check local directories for any SLANet/Table ONNX model
         for search_dir in ["./table_model", "./model/table", "./model", os.path.join(home, ".rapid_table")]:
             if os.path.isdir(search_dir):
                 for root, _, files in os.walk(search_dir):
                     for file in files:
                         if file.endswith(".onnx") and ("slanet" in file.lower() or "table" in file.lower()):
-                            return os.path.join(root, file)
+                            candidates.append(os.path.join(root, file))
 
-        # Automatic fallback download if no local weights exist
-        target_path = "./table_model/ch_ppstructure_mobile_v2_SLANet.onnx"
-        try:
-            import urllib.request
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            url = "https://huggingface.co/SWHL/RapidStructure/resolve/main/table/ch_ppstructure_mobile_v2_SLANet.onnx"
-            logger.info(f"Downloading SLANet ONNX weights from {url} to {target_path}...")
-            urllib.request.urlretrieve(url, target_path)
-            logger.info("SLANet weights downloaded successfully.")
-            return target_path
-        except Exception as e:
-            logger.warning(f"Could not auto-download SLANet model: {e}")
+        seen = set()
+        unique_candidates = []
+        for c in candidates:
+            abs_c = os.path.abspath(c)
+            if abs_c not in seen:
+                seen.add(abs_c)
+                unique_candidates.append(c)
 
-        return None
+        return unique_candidates
 
     def _init_engines(self, table_model_path: str = None, use_gpu: bool = False):
         try:
@@ -124,32 +131,52 @@ class TableRecognizerONNX:
         except Exception:
             logger.info("Pytesseract not found or tesseract binary missing. Cell text OCR will use heuristic clustering.")
 
-        model_path = self._find_or_download_model(table_model_path)
-        if not model_path or not os.path.exists(model_path):
-            logger.warning(
-                f"SLANet ONNX model not found. Checked: {table_model_path}. "
-                "Download weights with: curl -L https://huggingface.co/SWHL/RapidStructure/resolve/main/table/ch_ppstructure_mobile_v2_SLANet.onnx -o table_model/ch_ppstructure_mobile_v2_SLANet.onnx"
-            )
-            return
+        import onnxruntime as ort
+        available_providers = ort.get_available_providers()
+        providers = []
+        if use_gpu and "CUDAExecutionProvider" in available_providers:
+            providers.append("CUDAExecutionProvider")
+        providers.append("CPUExecutionProvider")
 
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+        candidates = self._get_candidate_model_paths(table_model_path)
+
+        # 1. Try loading all valid candidate files in priority order
+        for cand in candidates:
+            if self._is_valid_onnx_file(cand):
+                try:
+                    self.session = ort.InferenceSession(cand, sess_options, providers=providers)
+                    self.input_name = self.session.get_inputs()[0].name
+                    self.output_names = [out.name for out in self.session.get_outputs()]
+                    logger.info(f"Initialized native SLANet ONNX session from {cand} with providers: {providers}")
+                    return
+                except Exception as e:
+                    logger.warning(f"Failed to load candidate ONNX model from {cand}: {e}")
+
+        # 2. If no valid local ONNX model loaded, auto-download canonical SLANet weights from Hugging Face
+        download_target = "./table_model/ch_ppstructure_mobile_v2_SLANet.onnx"
         try:
-            import onnxruntime as ort
-            available_providers = ort.get_available_providers()
-            providers = []
-            if use_gpu and "CUDAExecutionProvider" in available_providers:
-                providers.append("CUDAExecutionProvider")
-            providers.append("CPUExecutionProvider")
-
-            sess_options = ort.SessionOptions()
-            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-
-            self.session = ort.InferenceSession(model_path, sess_options, providers=providers)
-            self.input_name = self.session.get_inputs()[0].name
-            self.output_names = [out.name for out in self.session.get_outputs()]
-            logger.info(f"Initialized native SLANet ONNX session from {model_path} with providers: {providers}")
+            import urllib.request
+            os.makedirs(os.path.dirname(download_target), exist_ok=True)
+            url = "https://huggingface.co/SWHL/RapidStructure/resolve/main/table/ch_ppstructure_mobile_v2_SLANet.onnx"
+            logger.info(f"Downloading SLANet ONNX weights from {url} to {download_target}...")
+            urllib.request.urlretrieve(url, download_target)
+            if self._is_valid_onnx_file(download_target):
+                self.session = ort.InferenceSession(download_target, sess_options, providers=providers)
+                self.input_name = self.session.get_inputs()[0].name
+                self.output_names = [out.name for out in self.session.get_outputs()]
+                logger.info(f"Successfully loaded auto-downloaded SLANet ONNX session from {download_target}")
+                return
         except Exception as e:
-            logger.warning(f"Could not initialize SLANet ONNX session: {e}")
-            self.session = None
+            logger.warning(f"Could not auto-download SLANet model: {e}")
+
+        logger.warning(
+            "SLANet ONNX model could not be initialized. Table extraction will rely on OCR geometric clustering fallback. "
+            "To enable neural structure detection, download the weights manually:\n"
+            "curl -L https://huggingface.co/SWHL/RapidStructure/resolve/main/table/ch_ppstructure_mobile_v2_SLANet.onnx -o table_model/ch_ppstructure_mobile_v2_SLANet.onnx"
+        )
 
     def _extract_ocr_tokens(self, img_bgr: np.ndarray) -> list[dict]:
         """
