@@ -154,12 +154,12 @@ class TableRecognizerONNX:
     def _extract_ocr_tokens(self, img_bgr: np.ndarray) -> list[dict]:
         """
         Extracts high-precision text tokens and bounding boxes from table image
-        using multi-scale Pytesseract preprocessing to preserve decimal points and small numbers.
+        using multi-scale and dual-polarity (normal + inverted) Pytesseract passes
+        to capture standard text as well as white-on-dark/colored header text.
         """
         if not self.use_tesseract:
             return []
 
-        toks = []
         try:
             import cv2
             import pytesseract
@@ -174,45 +174,76 @@ class TableRecognizerONNX:
             else:
                 scaled_bgr = img_bgr
 
-            img_rgb = cv2.cvtColor(scaled_bgr, cv2.COLOR_BGR2RGB)
+            def run_tesseract_pass(img_arr: np.ndarray) -> list[dict]:
+                rgb = cv2.cvtColor(img_arr, cv2.COLOR_BGR2RGB)
+                custom_config = r"--psm 6"
+                data = pytesseract.image_to_data(rgb, output_type=pytesseract.Output.DICT, config=custom_config)
+                n_boxes = len(data.get("text", []))
+                pass_toks = []
 
-            # PSM 6: Assume a single uniform block of text
-            custom_config = r"--psm 6"
-            data = pytesseract.image_to_data(img_rgb, output_type=pytesseract.Output.DICT, config=custom_config)
-            n_boxes = len(data.get("text", []))
+                for i in range(n_boxes):
+                    text_str = str(data["text"][i]).strip()
+                    if not text_str:
+                        continue
 
-            for i in range(n_boxes):
-                text_str = str(data["text"][i]).strip()
-                if not text_str:
-                    continue
+                    conf = float(data.get("conf", [100])[i])
+                    if conf < 0:
+                        continue
 
-                conf = float(data.get("conf", [100])[i])
-                if conf < 0:
-                    continue
+                    x = float(data["left"][i]) / scale_factor
+                    y = float(data["top"][i]) / scale_factor
+                    bw = float(data["width"][i]) / scale_factor
+                    bh = float(data["height"][i]) / scale_factor
 
-                x = float(data["left"][i]) / scale_factor
-                y = float(data["top"][i]) / scale_factor
-                bw = float(data["width"][i]) / scale_factor
-                bh = float(data["height"][i]) / scale_factor
+                    if bw <= 0 or bh <= 0:
+                        continue
 
-                if bw <= 0 or bh <= 0:
-                    continue
+                    x1, y1, x2, y2 = x, y, x + bw, y + bh
 
-                x1, y1, x2, y2 = x, y, x + bw, y + bh
+                    import re
+                    text_clean = re.sub(r'([.,:;!?])([A-Za-z])', r'\1 \2', text_str)
 
-                # Cleanup minor spacing artifacts after punctuation
-                import re
-                text_clean = re.sub(r'([.,:;!?])([A-Za-z])', r'\1 \2', text_str)
+                    pass_toks.append({
+                        "bbox": [x1, y1, x2, y2],
+                        "center": ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
+                        "text": text_clean,
+                    })
+                return pass_toks
 
-                toks.append({
-                    "bbox": [x1, y1, x2, y2],
-                    "center": ((x1 + x2) / 2.0, (y1 + y2) / 2.0),
-                    "text": text_clean,
-                })
+            # Pass 1: Standard contrast (dark text on light background)
+            normal_tokens = run_tesseract_pass(scaled_bgr)
+
+            # Pass 2: Inverted contrast (white/light text on dark/colored header background)
+            negated_tokens = run_tesseract_pass(255 - scaled_bgr)
+
+            # Merge and deduplicate tokens (Intersection over Min Area)
+            ocr_tokens = list(normal_tokens)
+            for n_tok in negated_tokens:
+                is_dup = False
+                nx1, ny1, nx2, ny2 = n_tok["bbox"]
+                n_area = max(0.0, (nx2 - nx1) * (ny2 - ny1))
+
+                for m_tok in ocr_tokens:
+                    mx1, my1, mx2, my2 = m_tok["bbox"]
+                    m_area = max(0.0, (mx2 - mx1) * (my2 - my1))
+
+                    ix1, iy1 = max(nx1, mx1), max(ny1, my1)
+                    ix2, iy2 = min(nx2, mx2), min(ny2, my2)
+                    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+
+                    if min(n_area, m_area) > 0 and (inter / min(n_area, m_area)) > 0.4:
+                        is_dup = True
+                        if len(n_tok["text"]) > len(m_tok["text"]) + 1:
+                            m_tok["text"] = n_tok["text"]
+                        break
+
+                if not is_dup:
+                    ocr_tokens.append(n_tok)
+
+            return ocr_tokens
         except Exception as e:
             logger.debug(f"Pytesseract table OCR failed: {e}")
-
-        return toks
+            return []
 
     @staticmethod
     def _normalize_box(b) -> list[float]:
@@ -387,7 +418,7 @@ class TableRecognizerONNX:
             tokens.sort(key=lambda t: (int(t["bbox"][1] / 10.0), t["bbox"][0]))
             cell_texts[c_idx] = " ".join(t["text"] for t in tokens).strip()
 
-        # Cell OCR fallback for empty cells
+        # Cell OCR fallback for empty cells (with dual-polarity support for dark/colored cells)
         if self.use_tesseract and img_bgr is not None:
             import pytesseract
             import cv2
@@ -395,12 +426,16 @@ class TableRecognizerONNX:
             for c_idx, norm_b in enumerate(cell_boxes):
                 if not cell_texts.get(c_idx) and norm_b is not None:
                     bx1, by1, bx2, by2 = norm_b
-                    cx1, cy1 = max(0, int(bx1) - 1), max(0, int(by1) - 1)
-                    cx2, cy2 = min(w, int(bx2) + 1), min(h, int(by2) + 1)
-                    if (cx2 - cx1) > 8 and (cy2 - cy1) > 8:
+                    cx1, cy1 = max(0, int(bx1) - 2), max(0, int(by1) - 2)
+                    cx2, cy2 = min(w, int(bx2) + 2), min(h, int(by2) + 2)
+                    if (cx2 - cx1) > 6 and (cy2 - cy1) > 6:
                         crop = img_bgr[cy1:cy2, cx1:cx2]
-                        crop_scaled = cv2.resize(crop, ((cx2 - cx1) * 3, (cy2 - cy1) * 3), interpolation=cv2.INTER_CUBIC)
-                        txt = pytesseract.image_to_string(cv2.cvtColor(crop_scaled, cv2.COLOR_BGR2RGB), config="--psm 7").strip()
+                        cw, ch = crop.shape[1], crop.shape[0]
+                        crop_scaled = cv2.resize(crop, (max(cw * 3, 60), max(ch * 3, 30)), interpolation=cv2.INTER_CUBIC)
+                        rgb_crop = cv2.cvtColor(crop_scaled, cv2.COLOR_BGR2RGB)
+                        txt = pytesseract.image_to_string(rgb_crop, config="--psm 7").strip()
+                        if not txt:
+                            txt = pytesseract.image_to_string(255 - rgb_crop, config="--psm 7").strip()
                         if txt:
                             cell_texts[c_idx] = txt
 
