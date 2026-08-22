@@ -4,6 +4,7 @@ import math
 import logging
 import urllib.request
 from pathlib import Path
+from typing import Optional, Union, List, Tuple, Dict
 import numpy as np
 import onnxruntime as ort
 from tokenizers import Tokenizer
