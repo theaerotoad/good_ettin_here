@@ -121,12 +121,30 @@ def compare_with_sentence_transformers(model_name: str, server_url: str):
     print(f"-----------------------------------------------------------------\n")
 
 
+def detect_server_model(server_url: str) -> str:
+    """Attempts to discover the loaded reranker model name from /health."""
+    try:
+        req = urllib.request.Request(f"{server_url}/health")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("model_name") or "cross-encoder/ettin-reranker-150m-v1"
+    except Exception:
+        return "cross-encoder/ettin-reranker-150m-v1"
+
+
 def main():
-    server_url = "http://localhost:8000"
-    model_name = "cross-encoder/ettin-reranker-150m-v1"
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Verify Ettin Reranker against canonical benchmarks.")
+    parser.add_argument("--server-url", type=str, default="http://localhost:8000", help="URL of running server")
+    parser.add_argument("--model", type=str, default=None, help="Hugging Face model ID for PyTorch comparison")
+    args = parser.parse_args()
+
+    server_url = args.server_url.rstrip("/")
+    model_name = args.model or detect_server_model(server_url)
 
     print("=================================================================")
-    print("RUNNING CANONICAL ETTIN RERANKER VERIFICATION SUITE")
+    print(f"RUNNING CANONICAL ETTIN RERANKER VERIFICATION SUITE ({model_name})")
     print("=================================================================")
 
     for case in CANONICAL_TEST_CASES:

@@ -3,6 +3,7 @@ import os
 MODEL_TYPE = os.getenv("MODEL_TYPE", "ettin").lower()
 MODEL_DIR = os.getenv("MODEL_DIR", "./model")
 MODEL_NAME = os.getenv("MODEL_NAME", "cross-encoder/ettin-reranker-150m-v1")
+ONNX_PATH = os.getenv("ONNX_PATH", None)
 
 EMBEDDING_MODEL_DIR = os.getenv("EMBEDDING_MODEL_DIR", None)
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "google/embeddinggemma-300m")

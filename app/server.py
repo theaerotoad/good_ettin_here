@@ -483,6 +483,8 @@ def main():
         help="Model type to host",
     )
     model_group.add_argument("--model-dir", type=str, default=config.MODEL_DIR, help="Path to local directory with default model files")
+    model_group.add_argument("--onnx-path", type=str, default=config.ONNX_PATH, help="Explicit path to ONNX model file (e.g. onnx/model_O4.onnx or model_qint8_arm64.onnx)")
+    model_group.add_argument("--model-name", type=str, default=config.MODEL_NAME, help="Reranker model identifier/name")
     model_group.add_argument("--embedding-model-dir", type=str, default=config.EMBEDDING_MODEL_DIR, help="Path to EmbeddingGemma directory (if different from model-dir)")
     model_group.add_argument("--doclaynet-model-dir", type=str, default=config.DOCLAYNET_MODEL_DIR, help="Path to DocLayNet directory (if different from model-dir)")
 
@@ -504,6 +506,8 @@ def main():
     # Update global config
     config.MODEL_TYPE = args.model_type
     config.MODEL_DIR = args.model_dir
+    config.ONNX_PATH = args.onnx_path
+    config.MODEL_NAME = args.model_name
     config.EMBEDDING_MODEL_DIR = args.embedding_model_dir or args.model_dir
     config.DOCLAYNET_MODEL_DIR = args.doclaynet_model_dir or args.model_dir
     
@@ -530,9 +534,12 @@ def main():
             logger.info(f"Initializing Ettin Reranker model from directory: {config.MODEL_DIR}")
             reranker_model = EttinONNXReranker(
                 model_dir=config.MODEL_DIR,
+                onnx_path=config.ONNX_PATH,
                 max_length=config.MAX_LENGTH,
                 use_gpu=config.USE_GPU,
             )
+            if reranker_model.model_name and (args.model_name == parser.get_default("model_name")):
+                config.MODEL_NAME = reranker_model.model_name
         except Exception as e:
             if model_type == "ettin":
                 raise e
