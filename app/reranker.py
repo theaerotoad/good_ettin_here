@@ -2,6 +2,7 @@ import os
 import json
 import math
 import logging
+import urllib.request
 from pathlib import Path
 import numpy as np
 import onnxruntime as ort
@@ -80,21 +81,54 @@ class EttinONNXReranker:
         # 3. Load classification head weights if required for backbone-only ONNX graphs
         self.head_weights = self._load_classification_head()
 
+        # Fail fast with an actionable message if backbone-only ONNX graph lacks head weights
+        backbone_only = (
+            any("last_hidden_state" in out.lower() or "token_embeddings" in out.lower() for out in self.output_names)
+            and not any("logits" in out.lower() or "score" in out.lower() for out in self.output_names)
+        )
+        if backbone_only and not self.head_weights:
+            repo_id = self._resolve_hf_repo_id()
+            raise FileNotFoundError(
+                f"The ONNX model in '{model_dir}' outputs 'last_hidden_state' (backbone only) and requires "
+                f"the classification head weights ('2_Dense', '3_LayerNorm', '4_Dense').\n"
+                f"Please ensure all model repository files are downloaded:\n"
+                f"  huggingface-cli download {repo_id} --local-dir {model_dir}"
+            )
+
     def _detect_model_name(self) -> str:
         """Attempts to infer the Ettin model variant from config.json or directory path."""
+        return self._resolve_hf_repo_id()
+
+    def _resolve_hf_repo_id(self) -> str:
+        """Resolves the canonical Hugging Face repository ID for the current model directory."""
         config_file = os.path.join(self.model_dir, "config.json")
         if os.path.exists(config_file):
             try:
                 with open(config_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    if "_name_or_path" in data and data["_name_or_path"]:
-                        return str(data["_name_or_path"])
+                    name = str(data.get("_name_or_path", ""))
+                    if "cross-encoder/ettin-reranker-" in name:
+                        return name
+                    for size in ["17m", "32m", "68m", "150m", "400m", "1b"]:
+                        if size in name.lower():
+                            return f"cross-encoder/ettin-reranker-{size}-v1"
             except Exception:
                 pass
-        dir_name = os.path.basename(os.path.abspath(self.model_dir))
-        if "ettin" in dir_name.lower():
-            return f"cross-encoder/{dir_name}"
-        return "cross-encoder/ettin-reranker"
+
+        combined = f"{self.model_dir}".lower()
+        for size in ["17m", "32m", "68m", "150m", "400m", "1b"]:
+            if size in combined:
+                return f"cross-encoder/ettin-reranker-{size}-v1"
+
+        return "cross-encoder/ettin-reranker-150m-v1"
+
+    @staticmethod
+    def _download_file(url: str, dest_path: str, timeout: int = 30) -> None:
+        """Downloads a remote file with standard headers and ensures parent directory exists."""
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Ettin-ONNX-Server)"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest_path, "wb") as f:
+            f.write(resp.read())
 
     @staticmethod
     def _is_valid_onnx_file(path: str) -> bool:
@@ -163,54 +197,109 @@ class EttinONNXReranker:
             f"No valid ONNX model file found in '{model_dir}'. Checked standard paths and subdirectories."
         )
 
+    @staticmethod
+    def _is_valid_safetensors(path: str) -> bool:
+        """Validates that a safetensors file exists, is not an unresolved Git LFS pointer, and is readable."""
+        if not path or not os.path.isfile(path):
+            return False
+        try:
+            size = os.path.getsize(path)
+            if size < 1000:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    head = f.read(100)
+                    if "git-lfs" in head or "oid sha256" in head:
+                        return False
+            load_file(path)
+            return True
+        except Exception:
+            return False
+
     def _load_classification_head(self) -> dict:
         """
-        Loads classification head weights (2_Dense, 3_LayerNorm, 4_Dense) from local safetensors files.
+        Loads classification head weights (2_Dense, 3_LayerNorm, 4_Dense) from local safetensors,
+        falling back to root safetensors or automatic download from Hugging Face Hub if missing.
         """
         weights = {}
 
-        def find_safetensor(module_name: str):
-            candidates = [
-                os.path.join(self.model_dir, module_name, "model.safetensors"),
-                os.path.join(self.model_dir, f"{module_name}.safetensors"),
-                os.path.join(self.model_dir, module_name, "dense.safetensors"),
-            ]
-            for cand in candidates:
-                if os.path.exists(cand):
-                    return cand
+        def find_module_safetensor(module_names: list[str]) -> Optional[str]:
+            for mod in module_names:
+                for fname in ["model.safetensors", f"{mod}.safetensors", "dense.safetensors", "layer_norm.safetensors"]:
+                    cand = os.path.join(self.model_dir, mod, fname)
+                    if self._is_valid_safetensors(cand):
+                        return cand
+                    cand = os.path.join(self.model_dir, fname)
+                    if mod.lower() in fname.lower() and self._is_valid_safetensors(cand):
+                        return cand
+
+            for root, _, files in os.walk(self.model_dir):
+                for f in files:
+                    if f.endswith(".safetensors"):
+                        full_path = os.path.join(root, f)
+                        parent = os.path.basename(root).lower()
+                        for mod in module_names:
+                            if (mod.lower() in parent or mod.lower() in f.lower()) and self._is_valid_safetensors(full_path):
+                                return full_path
             return None
 
-        d2_path = find_safetensor("2_Dense")
-        ln3_path = find_safetensor("3_LayerNorm")
-        d4_path = find_safetensor("4_Dense")
+        # 1. Look for per-module safetensors subdirectories
+        d2_path = find_module_safetensor(["2_Dense", "2_dense", "dense"])
+        ln3_path = find_module_safetensor(["3_LayerNorm", "3_layernorm", "layernorm"])
+        d4_path = find_module_safetensor(["4_Dense", "4_dense", "out_proj"])
 
         if d2_path and ln3_path and d4_path:
-            logger.info("Loading classification head weights from safetensors...")
+            logger.info("Loading classification head weights from module safetensors...")
             weights["d2"] = load_file(d2_path)
             weights["ln3"] = load_file(ln3_path)
             weights["d4"] = load_file(d4_path)
             logger.info("Successfully loaded classification head weights.")
-        else:
-            root_sf = os.path.join(self.model_dir, "model.safetensors")
-            if os.path.exists(root_sf):
+            return weights
+
+        # 2. Look for unified root model.safetensors
+        for cand in [os.path.join(self.model_dir, "model.safetensors"), os.path.join(self.model_dir, "pytorch_model.safetensors")]:
+            if self._is_valid_safetensors(cand):
                 try:
-                    full_weights = load_file(root_sf)
-                    d2_tensors = {k: v for k, v in full_weights.items() if "2_Dense" in k or "classifier.dense" in k}
-                    ln3_tensors = {k: v for k, v in full_weights.items() if "3_LayerNorm" in k or "classifier.layer_norm" in k or "classifier.norm" in k}
-                    d4_tensors = {k: v for k, v in full_weights.items() if "4_Dense" in k or "classifier.out_proj" in k or "classifier.linear" in k}
+                    full_weights = load_file(cand)
+                    d2_tensors = {k: v for k, v in full_weights.items() if any(x in k for x in ["2_Dense", "2.linear", "classifier.dense"])}
+                    ln3_tensors = {k: v for k, v in full_weights.items() if any(x in k for x in ["3_LayerNorm", "3.norm", "classifier.layer_norm", "classifier.norm"])}
+                    d4_tensors = {k: v for k, v in full_weights.items() if any(x in k for x in ["4_Dense", "4.linear", "classifier.out_proj", "classifier.linear"])}
                     if d2_tensors and ln3_tensors and d4_tensors:
                         weights["d2"] = d2_tensors
                         weights["ln3"] = ln3_tensors
                         weights["d4"] = d4_tensors
                         logger.info("Successfully extracted classification head weights from root model.safetensors.")
+                        return weights
                 except Exception as e:
                     logger.warning(f"Could not parse root safetensors: {e}")
 
-        if not weights:
-            logger.info(
-                "Classification head safetensors not found locally. "
-                "Will assume ONNX model outputs logits directly."
-            )
+        # 3. Auto-download tiny head files from Hugging Face if model outputs raw embeddings
+        repo_id = self._resolve_hf_repo_id()
+        if repo_id:
+            logger.info(f"Classification head safetensors missing locally. Attempting to fetch from Hugging Face Hub ({repo_id})...")
+            files_to_download = [
+                ("2_Dense/model.safetensors", os.path.join(self.model_dir, "2_Dense", "model.safetensors")),
+                ("3_LayerNorm/model.safetensors", os.path.join(self.model_dir, "3_LayerNorm", "model.safetensors")),
+                ("4_Dense/model.safetensors", os.path.join(self.model_dir, "4_Dense", "model.safetensors")),
+            ]
+            all_downloaded = True
+            for hf_subpath, local_dest in files_to_download:
+                url = f"https://huggingface.co/{repo_id}/resolve/main/{hf_subpath}"
+                try:
+                    logger.info(f"Downloading classification head component: {hf_subpath}...")
+                    self._download_file(url, local_dest)
+                    if not self._is_valid_safetensors(local_dest):
+                        all_downloaded = False
+                        break
+                except Exception as dl_err:
+                    logger.warning(f"Failed to auto-download {hf_subpath}: {dl_err}")
+                    all_downloaded = False
+                    break
+
+            if all_downloaded:
+                weights["d2"] = load_file(files_to_download[0][1])
+                weights["ln3"] = load_file(files_to_download[1][1])
+                weights["d4"] = load_file(files_to_download[2][1])
+                logger.info("Successfully downloaded and initialized classification head weights.")
+                return weights
 
         return weights
 
