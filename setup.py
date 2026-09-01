@@ -29,7 +29,7 @@ RESET = "\033[0m"
 
 def print_banner():
     print(f"\n{CYAN}{BOLD}================================================================{RESET}")
-    print(f"{CYAN}{BOLD}     Ettin ONNX Server - Model Setup & Configuration Wizard     {RESET}")
+    print(f"{CYAN}{BOLD}      Ettin ONNX Server - Model Setup & Configuration Wizard     {RESET}")
     print(f"{CYAN}{BOLD}================================================================{RESET}\n")
 
 
@@ -229,8 +229,17 @@ def check_embedding_exists(dest_dir: str) -> bool:
 
 def check_doclaynet_exists(dest_dir: str, variant: str = "yolov8x") -> bool:
     """Checks if valid DocLayNet YOLOv8 ONNX model exists locally."""
-    onnx_file = DOCLAYNET_VARIANTS.get(variant, {}).get("onnx_file", f"{variant}-doclaynet.onnx")
-    candidates = [onnx_file, "best.onnx", "model.onnx", f"{variant}.onnx", f"{variant}-doclaynet.onnx"]
+    onnx_file = DOCLAYNET_VARIANTS.get(variant, {}).get("onnx_file", "model_quantized.onnx")
+    candidates = [
+        onnx_file,
+        "model_quantized.onnx",
+        "onnx/model_quantized.onnx",
+        "model.onnx",
+        "onnx/model.onnx",
+        "best.onnx",
+        f"{variant}.onnx",
+        f"{variant}-doclaynet.onnx",
+    ]
     return any(is_valid_file(os.path.join(dest_dir, f), min_size_kb=5000) for f in candidates)
 
 
@@ -250,27 +259,27 @@ ETTIN_SIZES = ["17m", "32m", "68m", "150m", "400m", "1b"]
 DOCLAYNET_VARIANTS = {
     "yolov8n": {
         "repo": "Oblix/yolov8n-doclaynet_ONNX",
-        "onnx_file": "yolov8n-doclaynet.onnx",
+        "onnx_file": "model_quantized.onnx",
         "name": "yolov8n-doclaynet",
         "desc": "Nano model (~13 MB) - ultra fast CPU inference",
     },
     "yolov8s": {
         "repo": "Oblix/yolov8s-doclaynet_ONNX",
-        "onnx_file": "yolov8s-doclaynet.onnx",
+        "onnx_file": "model_quantized.onnx",
         "name": "yolov8s-doclaynet",
         "desc": "Small model (~44 MB) - balanced speed & accuracy",
     },
     "yolov8m": {
         "repo": "Oblix/yolov8m-doclaynet_ONNX",
-        "onnx_file": "yolov8m-doclaynet.onnx",
+        "onnx_file": "model_quantized.onnx",
         "name": "yolov8m-doclaynet",
         "desc": "Medium model (~100 MB) - higher visual detail",
     },
     "yolov8x": {
         "repo": "Oblix/yolov8x-doclaynet_ONNX",
-        "onnx_file": "yolov8x-doclaynet.onnx",
+        "onnx_file": "model_quantized.onnx",
         "name": "yolov8x-doclaynet",
-        "desc": "Extra Large model (~270 MB) - maximum bounding box precision (Recommended)",
+        "desc": "Extra Large model INT8 quantized (~70 MB) - maximum bounding box precision (Recommended)",
     },
 }
 
@@ -350,21 +359,25 @@ def download_doclaynet(dest_dir: str, variant: str) -> tuple[Optional[str], Opti
     """Downloads YOLOv8 DocLayNet layout analysis model and config."""
     meta = DOCLAYNET_VARIANTS.get(variant, DOCLAYNET_VARIANTS["yolov8x"])
     repo_id = meta["repo"]
-    onnx_name = meta["onnx_file"]
+    onnx_name = meta.get("onnx_file", "model_quantized.onnx")
     base_url = f"https://huggingface.co/{repo_id}/resolve/main"
 
-    # Try common filename patterns found across YOLO HuggingFace repos
+    # Prioritize 8-bit quantized ONNX model, followed by standard paths across YOLO repos
     onnx_candidates = [
-        onnx_name,
-        "best.onnx",
+        "onnx/model_quantized.onnx",
+        "model_quantized.onnx",
+        "onnx/model.onnx",
         "model.onnx",
+        f"{variant}-doclaynet.onnx",
         f"{variant}.onnx",
-        f"{variant}_doclaynet.onnx",
+        "best.onnx",
         "weights/best.onnx",
     ]
 
     files_spec = [
         (["config.json"], "config.json", True, 0),
+        (["preprocessor_config.json"], "preprocessor_config.json", True, 0),
+        (["quantize_config.json"], "quantize_config.json", True, 0),
         (onnx_candidates, onnx_name, False, 5000),
     ]
 
