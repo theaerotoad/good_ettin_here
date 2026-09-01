@@ -640,7 +640,7 @@ def main():
     # 5. Server Settings & config.yaml Generation
     # --------------------------------------------------------------------------
     print(f"\n{BOLD}5. Server & Execution Settings{RESET}")
-    host = "0.0.0.0" if args.yes else prompt_input("Server Host IP", "0.0.0.0")
+    host = "127.0.0.1" if args.yes else prompt_input("Server Host IP", "127.0.0.1")
     port_str = "8000" if args.yes else prompt_input("Server Port", "8000")
     try:
         port = int(port_str)
