@@ -58,9 +58,12 @@ class EttinONNXReranker:
         self.tokenizer.enable_truncation(max_length=self.max_length, strategy="longest_first")
         self.tokenizer.enable_padding(pad_id=pad_id, pad_token=pad_token)
 
-        # 2. Locate and load local ONNX model
-        actual_onnx_path = self._find_onnx_model(model_dir, onnx_path)
-        logger.info(f"Loading ONNX model ({self.model_name}) from {actual_onnx_path}...")
+        # 2. Locate and load local ONNX model with candidate fallback
+        candidates = self._find_onnx_candidates(model_dir, onnx_path)
+        if not candidates:
+            raise FileNotFoundError(
+                f"No valid ONNX model file found in '{model_dir}'. Checked standard paths and subdirectories."
+            )
 
         # Select ONNX execution providers
         available_providers = ort.get_available_providers()
@@ -80,10 +83,26 @@ class EttinONNXReranker:
         sess_options.inter_op_num_threads = inter_threads
         sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
-        logger.info(
-            f"Initializing ONNX InferenceSession (intra_threads={intra_threads}, inter_threads={inter_threads}) with providers: {providers}"
-        )
-        self.session = ort.InferenceSession(actual_onnx_path, sess_options, providers=providers)
+        self.session = None
+        self.onnx_path = None
+        last_error = None
+
+        for cand_path in candidates:
+            try:
+                logger.info(f"Attempting to load ONNX model ({self.model_name}) from {cand_path}...")
+                self.session = ort.InferenceSession(cand_path, sess_options, providers=providers)
+                self.onnx_path = cand_path
+                logger.info(
+                    f"Successfully initialized ONNX InferenceSession (intra_threads={intra_threads}, inter_threads={inter_threads}) from {cand_path}"
+                )
+                break
+            except Exception as e:
+                logger.warning(f"Could not load ONNX model from candidate {cand_path}: {e}")
+                last_error = e
+
+        if self.session is None:
+            raise RuntimeError(f"Failed to load any ONNX model candidate in '{model_dir}'. Last error: {last_error}")
+
         self.input_names = [inp.name for inp in self.session.get_inputs()]
         self.output_names = [out.name for out in self.session.get_outputs()]
         logger.info(f"ONNX Model inputs expected: {self.input_names}")
@@ -158,16 +177,17 @@ class EttinONNXReranker:
         except Exception:
             return False
 
-    def _find_onnx_model(self, model_dir: str, onnx_path: str = None) -> str:
-        """Locates ONNX model across standard Hugging Face Optimum and quantized conventions."""
+    def _find_onnx_candidates(self, model_dir: str, onnx_path: str = None) -> list[str]:
+        """Locates candidate ONNX models across standard Hugging Face Optimum and quantized conventions."""
+        found = []
         if onnx_path and self._is_valid_onnx_file(onnx_path):
-            return onnx_path
+            return [onnx_path]
 
         if onnx_path:
             for parent in [model_dir, os.path.join(model_dir, "onnx")]:
                 cand = os.path.join(parent, onnx_path)
                 if self._is_valid_onnx_file(cand):
-                    return cand
+                    return [cand]
 
         candidates = [
             os.path.join(model_dir, "model_quantized.onnx"),
@@ -180,30 +200,36 @@ class EttinONNXReranker:
             os.path.join(model_dir, "model_quint8_avx2.onnx"),
             os.path.join(model_dir, "onnx", "model_qint8_arm64.onnx"),
             os.path.join(model_dir, "model_qint8_arm64.onnx"),
-            os.path.join(model_dir, "onnx", "model_O4.onnx"),
-            os.path.join(model_dir, "model_O4.onnx"),
+            os.path.join(model_dir, "model.onnx"),
+            os.path.join(model_dir, "onnx", "model.onnx"),
             os.path.join(model_dir, "onnx", "model_O3.onnx"),
             os.path.join(model_dir, "model_O3.onnx"),
             os.path.join(model_dir, "onnx", "model_O2.onnx"),
             os.path.join(model_dir, "model_O2.onnx"),
             os.path.join(model_dir, "onnx", "model_O1.onnx"),
             os.path.join(model_dir, "model_O1.onnx"),
-            os.path.join(model_dir, "onnx", "model.onnx"),
-            os.path.join(model_dir, "model.onnx"),
+            os.path.join(model_dir, "onnx", "model_O4.onnx"),
+            os.path.join(model_dir, "model_O4.onnx"),
         ]
 
         for cand in candidates:
-            if self._is_valid_onnx_file(cand):
-                return cand
+            if self._is_valid_onnx_file(cand) and cand not in found:
+                found.append(cand)
 
         for search_dir in [os.path.join(model_dir, "onnx"), model_dir]:
             if os.path.exists(search_dir):
                 for fname in sorted(os.listdir(search_dir)):
                     if fname.endswith(".onnx"):
                         cand = os.path.join(search_dir, fname)
-                        if self._is_valid_onnx_file(cand):
-                            return cand
+                        if self._is_valid_onnx_file(cand) and cand not in found:
+                            found.append(cand)
 
+        return found
+
+    def _find_onnx_model(self, model_dir: str, onnx_path: str = None) -> str:
+        candidates = self._find_onnx_candidates(model_dir, onnx_path)
+        if candidates:
+            return candidates[0]
         raise FileNotFoundError(
             f"No valid ONNX model file found in '{model_dir}'. Checked standard paths and subdirectories."
         )

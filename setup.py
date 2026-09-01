@@ -195,6 +195,7 @@ def quantize_onnx_model(input_onnx_path: str, output_onnx_path: str) -> bool:
     """Quantizes an ONNX FP32 model to dynamic INT8 using onnxruntime.quantization."""
     try:
         from onnxruntime.quantization import quantize_dynamic, QuantType
+        import onnxruntime as ort
     except ImportError as err:
         print(f"  {YELLOW}Quantization dependency missing ({err}). Install with: pip install onnx{RESET}")
         return False
@@ -202,21 +203,37 @@ def quantize_onnx_model(input_onnx_path: str, output_onnx_path: str) -> bool:
     print(f"  {CYAN}Quantizing ONNX model to INT8 (dynamic)...{RESET}")
     print(f"  Input : {input_onnx_path} ({os.path.getsize(input_onnx_path) / (1024 * 1024):.1f} MB)")
     try:
+        # Quantize MatMul and Gemm ops only; exclude Gather (token embeddings) to prevent invalid DequantizeLinear graphs
         quantize_dynamic(
             model_input=input_onnx_path,
             model_output=output_onnx_path,
+            op_types_to_quantize=["MatMul", "Gemm"],
             weight_type=QuantType.QInt8,
             per_channel=True,
             reduce_range=True,
         )
         if is_valid_file(output_onnx_path, min_size_kb=500):
-            print(f"  {GREEN}Quantized model created:{RESET} {output_onnx_path} ({os.path.getsize(output_onnx_path) / (1024 * 1024):.1f} MB)")
-            return True
+            # Verify the quantized ONNX graph loads cleanly in ONNX Runtime
+            try:
+                test_opt = ort.SessionOptions()
+                test_opt.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+                _ = ort.InferenceSession(output_onnx_path, test_opt, providers=["CPUExecutionProvider"])
+                print(f"  {GREEN}Quantized model verified and saved:{RESET} {output_onnx_path} ({os.path.getsize(output_onnx_path) / (1024 * 1024):.1f} MB)")
+                return True
+            except Exception as val_err:
+                print(f"  {RED}Generated quantized graph validation failed: {val_err}{RESET}")
+                if os.path.exists(output_onnx_path):
+                    os.remove(output_onnx_path)
+                return False
         else:
             print(f"  {RED}Quantization output invalid or missing.{RESET}")
+            if os.path.exists(output_onnx_path):
+                os.remove(output_onnx_path)
             return False
     except Exception as e:
         print(f"  {RED}Failed to quantize model: {e}{RESET}")
+        if os.path.exists(output_onnx_path):
+            os.remove(output_onnx_path)
         return False
 
 
@@ -330,7 +347,7 @@ def download_ettin_reranker(dest_dir: str, size: str) -> Optional[str]:
         (["tokenizer.json"], "tokenizer.json", False, 1),
         (["tokenizer_config.json"], "tokenizer_config.json", True, 0),
         (["special_tokens_map.json"], "special_tokens_map.json", True, 0),
-        (["onnx/model_O4.onnx", "onnx/model.onnx", "model.onnx", "onnx/model_quantized.onnx"], "model.onnx", False, 1000),
+        (["onnx/model.onnx", "model.onnx", "onnx/model_O3.onnx", "onnx/model_O2.onnx", "onnx/model_O1.onnx", "onnx/model_O4.onnx"], "model.onnx", False, 1000),
         (["onnx/model_O4.onnx_data", "onnx/model.onnx_data", "model.onnx_data"], "model.onnx_data", True, 1000),
         (["2_Dense/model.safetensors", "dense/model.safetensors"], "2_Dense/model.safetensors", True, 10),
         (["3_LayerNorm/model.safetensors", "layernorm/model.safetensors"], "3_LayerNorm/model.safetensors", True, 1),
@@ -590,7 +607,7 @@ def main():
     # Optional INT8 Dynamic Quantization for Ettin
     quantized_path = os.path.join(target_dir, "model_quantized.onnx")
     base_onnx_path = None
-    for cand in ["model.onnx", "model_O4.onnx", "onnx/model_O4.onnx", "onnx/model.onnx"]:
+    for cand in ["model.onnx", "onnx/model.onnx", "onnx/model_O3.onnx", "onnx/model_O2.onnx", "onnx/model_O1.onnx", "model_O4.onnx", "onnx/model_O4.onnx"]:
         p = os.path.join(target_dir, cand)
         if is_valid_file(p, min_size_kb=1000):
             base_onnx_path = p
