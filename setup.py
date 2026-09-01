@@ -191,8 +191,69 @@ def download_file_with_candidates(
 # ==============================================================================
 # Model Existence Validators
 # ==============================================================================
+def is_fp16_onnx_model(onnx_path: str) -> bool:
+    """Checks if an ONNX model contains float16 graph inputs, initializers, or value infos."""
+    try:
+        import onnx
+        from onnx import TensorProto
+        model = onnx.load(onnx_path, load_external_data=False)
+        for init in model.graph.initializer:
+            if init.data_type == TensorProto.FLOAT16:
+                return True
+        for vi in list(model.graph.input) + list(model.graph.value_info):
+            if vi.type.tensor_type.elem_type == TensorProto.FLOAT16:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def convert_onnx_fp16_to_fp32(input_path: str, output_path: str) -> bool:
+    """Converts an FP16 or mixed-precision ONNX model to FP32 using ONNX and NumPy."""
+    try:
+        import onnx
+        from onnx import TensorProto, numpy_helper
+        import numpy as np
+
+        model = onnx.load(input_path)
+
+        for tensor_list in [model.graph.input, model.graph.output, model.graph.value_info]:
+            for vi in tensor_list:
+                if vi.type.tensor_type.elem_type == TensorProto.FLOAT16:
+                    vi.type.tensor_type.elem_type = TensorProto.FLOAT
+
+        new_inits = []
+        for init in model.graph.initializer:
+            if init.data_type == TensorProto.FLOAT16:
+                arr = numpy_helper.to_array(init).astype(np.float32)
+                new_inits.append(numpy_helper.from_array(arr, name=init.name))
+            else:
+                new_inits.append(init)
+        del model.graph.initializer[:]
+        model.graph.initializer.extend(new_inits)
+
+        for node in model.graph.node:
+            for attr in node.attribute:
+                if attr.type == onnx.AttributeProto.TENSOR and attr.t.data_type == TensorProto.FLOAT16:
+                    arr = numpy_helper.to_array(attr.t).astype(np.float32)
+                    attr.t.CopyFrom(numpy_helper.from_array(arr, name=attr.t.name))
+                elif attr.type == onnx.AttributeProto.TENSORS:
+                    for t in attr.tensors:
+                        if t.data_type == TensorProto.FLOAT16:
+                            arr = numpy_helper.to_array(t).astype(np.float32)
+                            t.CopyFrom(numpy_helper.from_array(arr, name=t.name))
+                if node.op_type == "Cast" and attr.name == "to" and attr.i == TensorProto.FLOAT16:
+                    attr.i = TensorProto.FLOAT
+
+        onnx.save(model, output_path)
+        return True
+    except Exception as e:
+        print(f"  {YELLOW}FP16->FP32 conversion warning: {e}{RESET}")
+        return False
+
+
 def quantize_onnx_model(input_onnx_path: str, output_onnx_path: str) -> bool:
-    """Quantizes an ONNX FP32 model to dynamic INT8 using onnxruntime.quantization."""
+    """Quantizes an ONNX model to dynamic INT8 using onnxruntime.quantization."""
     try:
         from onnxruntime.quantization import quantize_dynamic, QuantType
         import onnxruntime as ort
@@ -202,10 +263,19 @@ def quantize_onnx_model(input_onnx_path: str, output_onnx_path: str) -> bool:
 
     print(f"  {CYAN}Quantizing ONNX model to INT8 (dynamic)...{RESET}")
     print(f"  Input : {input_onnx_path} ({os.path.getsize(input_onnx_path) / (1024 * 1024):.1f} MB)")
+
+    quant_source_path = input_onnx_path
+    temp_fp32_path = f"{input_onnx_path}.fp32.tmp"
+
     try:
+        if is_fp16_onnx_model(input_onnx_path):
+            print(f"  {CYAN}Detected FP16 tensors in input model. Converting to FP32 baseline for INT8 quantization...{RESET}")
+            if convert_onnx_fp16_to_fp32(input_onnx_path, temp_fp32_path):
+                quant_source_path = temp_fp32_path
+
         # Quantize MatMul and Gemm ops only; exclude Gather (token embeddings) to prevent invalid DequantizeLinear graphs
         quantize_dynamic(
-            model_input=input_onnx_path,
+            model_input=quant_source_path,
             model_output=output_onnx_path,
             op_types_to_quantize=["MatMul", "Gemm"],
             weight_type=QuantType.QInt8,
@@ -235,6 +305,12 @@ def quantize_onnx_model(input_onnx_path: str, output_onnx_path: str) -> bool:
         if os.path.exists(output_onnx_path):
             os.remove(output_onnx_path)
         return False
+    finally:
+        if os.path.exists(temp_fp32_path):
+            try:
+                os.remove(temp_fp32_path)
+            except Exception:
+                pass
 
 
 def check_reranker_exists(dest_dir: str) -> bool:
@@ -347,8 +423,8 @@ def download_ettin_reranker(dest_dir: str, size: str) -> Optional[str]:
         (["tokenizer.json"], "tokenizer.json", False, 1),
         (["tokenizer_config.json"], "tokenizer_config.json", True, 0),
         (["special_tokens_map.json"], "special_tokens_map.json", True, 0),
-        (["onnx/model.onnx", "model.onnx", "onnx/model_O3.onnx", "onnx/model_O2.onnx", "onnx/model_O1.onnx", "onnx/model_O4.onnx"], "model.onnx", False, 1000),
-        (["onnx/model_O4.onnx_data", "onnx/model.onnx_data", "model.onnx_data"], "model.onnx_data", True, 1000),
+        (["onnx/model_O2.onnx", "onnx/model_O1.onnx", "onnx/model.onnx", "model.onnx", "onnx/model_O3.onnx", "onnx/model_O4.onnx"], "model.onnx", False, 1000),
+        (["onnx/model_O2.onnx_data", "onnx/model_O1.onnx_data", "onnx/model.onnx_data", "model.onnx_data", "onnx/model_O4.onnx_data"], "model.onnx_data", True, 1000),
         (["2_Dense/model.safetensors", "dense/model.safetensors"], "2_Dense/model.safetensors", True, 10),
         (["3_LayerNorm/model.safetensors", "layernorm/model.safetensors"], "3_LayerNorm/model.safetensors", True, 1),
         (["4_Dense/model.safetensors", "dense_1/model.safetensors"], "4_Dense/model.safetensors", True, 1),
