@@ -143,78 +143,46 @@ def create_embeddings():
     if request.method == "OPTIONS":
         return "", 200
 
-    if reranker_model is None and embedding_model is None:
-        return jsonify({"error": {"message": "Model server not initialized", "type": "server_error"}}), 503
-
-    payload = request.get_json(force=True, silent=True) or {}
-
-    # Case A: EmbeddingGemma or Embeddings model loaded -> Produce dense float vector embeddings
-    if embedding_model is not None:
-        raw_input = payload.get("input")
-        texts = []
-        if isinstance(raw_input, str):
-            texts = [raw_input]
-        elif isinstance(raw_input, list):
-            texts = [str(item) for item in raw_input]
-        elif "documents" in payload and isinstance(payload["documents"], list):
-            texts = [str(doc) for doc in payload["documents"]]
-        elif "query" in payload:
-            texts = [str(payload["query"])]
-
-        if not texts:
-            return jsonify({
-                "error": {
-                    "message": "Missing 'input' field (string or list of strings) for embeddings endpoint.",
-                    "type": "invalid_request_error",
-                }
-            }), 400
-
-        embeddings, total_tokens = embedding_model.embed(texts, batch_size=config.BATCH_SIZE)
-
-        data_items = [
-            {
-                "object": "embedding",
-                "embedding": vec,
-                "index": idx,
-            }
-            for idx, vec in enumerate(embeddings)
-        ]
-
-        model_id = payload.get("model") or config.EMBEDDING_MODEL_NAME
-
-        return jsonify({
-            "object": "list",
-            "data": data_items,
-            "model": model_id,
-            "usage": {
-                "prompt_tokens": total_tokens,
-                "total_tokens": total_tokens,
-            },
-        })
-
-    # Case B: Ettin Reranker mode fallback -> Extract pairs and return scalar scores
-    pairs = extract_pairs(payload)
-    if not pairs:
+    if embedding_model is None:
         return jsonify({
             "error": {
-                "message": "Unable to extract valid (query, document) pairs from request payload.",
+                "message": "Embedding model is not loaded or failed initialization. Verify embedding model files in startup directory.",
+                "type": "server_error",
+            }
+        }), 503
+
+    payload = request.get_json(force=True, silent=True) or {}
+    raw_input = payload.get("input")
+    texts = []
+    if isinstance(raw_input, str):
+        texts = [raw_input]
+    elif isinstance(raw_input, list):
+        texts = [str(item) for item in raw_input]
+    elif "documents" in payload and isinstance(payload["documents"], list):
+        texts = [str(doc) for doc in payload["documents"]]
+    elif "query" in payload:
+        texts = [str(payload["query"])]
+
+    if not texts:
+        return jsonify({
+            "error": {
+                "message": "Missing 'input' field (string or list of strings) for embeddings endpoint.",
                 "type": "invalid_request_error",
             }
         }), 400
 
-    scores, total_tokens = reranker_model.predict(pairs, batch_size=config.BATCH_SIZE)
+    embeddings, total_tokens = embedding_model.embed(texts, batch_size=config.BATCH_SIZE)
 
     data_items = [
         {
             "object": "embedding",
-            "embedding": [score],
-            "score": score,
+            "embedding": vec,
             "index": idx,
         }
-        for idx, score in enumerate(scores)
+        for idx, vec in enumerate(embeddings)
     ]
 
-    model_id = payload.get("model") or config.MODEL_NAME
+    model_id = payload.get("model") or config.EMBEDDING_MODEL_NAME
 
     return jsonify({
         "object": "list",

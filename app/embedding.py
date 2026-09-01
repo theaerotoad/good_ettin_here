@@ -55,9 +55,10 @@ class EmbeddingGemmaONNX:
             actual_onnx_path = onnx_path
         else:
             candidates = [
-                os.path.join(model_dir, "onnx", "model.onnx"),
-                os.path.join(model_dir, "model.onnx"),
                 os.path.join(model_dir, "model_quantized.onnx"),
+                os.path.join(model_dir, "onnx", "model_quantized.onnx"),
+                os.path.join(model_dir, "model.onnx"),
+                os.path.join(model_dir, "onnx", "model.onnx"),
                 os.path.join(model_dir, "embedding_model.onnx"),
             ]
             actual_onnx_path = None

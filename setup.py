@@ -202,13 +202,29 @@ def check_reranker_exists(dest_dir: str) -> bool:
 
 
 def check_embedding_exists(dest_dir: str) -> bool:
-    """Checks if valid EmbeddingGemma ONNX and tokenizer files exist locally."""
-    has_onnx = any(
-        is_valid_file(os.path.join(dest_dir, f), min_size_kb=1000)
-        for f in ["model_quantized.onnx", "model.onnx", "onnx/model_quantized.onnx", "onnx/model.onnx"]
-    )
+    """Checks if valid EmbeddingGemma ONNX (and companion external data) and tokenizer exist locally."""
     has_tok = is_valid_file(os.path.join(dest_dir, "tokenizer.json"), min_size_kb=1)
-    return has_onnx and has_tok
+    if not has_tok:
+        return False
+
+    for fname in ["model_quantized.onnx", "model.onnx", "onnx/model_quantized.onnx", "onnx/model.onnx"]:
+        onnx_p = os.path.join(dest_dir, fname)
+        if is_valid_file(onnx_p, min_size_kb=50):
+            # Standalone ONNX (> 50 MB) containing embedded weights
+            if os.path.getsize(onnx_p) >= 50 * 1024 * 1024:
+                return True
+            # ONNX graph using external tensor data file (.onnx_data / .onnx.data)
+            data_candidates = [
+                f"{onnx_p}_data",
+                f"{onnx_p}.data",
+                os.path.join(dest_dir, "model_quantized.onnx_data"),
+                os.path.join(dest_dir, "model_quantized.onnx.data"),
+                os.path.join(dest_dir, "model.onnx_data"),
+                os.path.join(dest_dir, "model.onnx.data"),
+            ]
+            if any(is_valid_file(df, min_size_kb=1000) for df in data_candidates):
+                return True
+    return False
 
 
 def check_doclaynet_exists(dest_dir: str, variant: str = "yolov8x") -> bool:
@@ -270,6 +286,7 @@ def download_ettin_reranker(dest_dir: str, size: str) -> Optional[str]:
         (["tokenizer_config.json"], "tokenizer_config.json", True, 0),
         (["special_tokens_map.json"], "special_tokens_map.json", True, 0),
         (["onnx/model_O4.onnx", "onnx/model.onnx", "model.onnx", "onnx/model_quantized.onnx"], "model.onnx", False, 1000),
+        (["onnx/model_O4.onnx_data", "onnx/model.onnx_data", "model.onnx_data"], "model.onnx_data", True, 1000),
         (["2_Dense/model.safetensors", "dense/model.safetensors"], "2_Dense/model.safetensors", True, 10),
         (["3_LayerNorm/model.safetensors", "layernorm/model.safetensors"], "3_LayerNorm/model.safetensors", True, 1),
         (["4_Dense/model.safetensors", "dense_1/model.safetensors"], "4_Dense/model.safetensors", True, 1),
@@ -293,7 +310,7 @@ def download_ettin_reranker(dest_dir: str, size: str) -> Optional[str]:
 
 
 def download_embedding_gemma(dest_dir: str) -> Optional[str]:
-    """Downloads EmbeddingGemma ONNX dense vector model files."""
+    """Downloads EmbeddingGemma ONNX dense vector model files and external weight data."""
     repo_id = "onnx-community/embeddinggemma-300m-ONNX"
     base_url = f"https://huggingface.co/{repo_id}/resolve/main"
 
@@ -302,7 +319,15 @@ def download_embedding_gemma(dest_dir: str) -> Optional[str]:
         (["tokenizer.json"], "tokenizer.json", False, 1),
         (["tokenizer_config.json"], "tokenizer_config.json", True, 0),
         (["special_tokens_map.json"], "special_tokens_map.json", True, 0),
-        (["onnx/model_quantized.onnx", "onnx/model.onnx", "model_quantized.onnx", "model.onnx"], "model_quantized.onnx", False, 1000),
+        (["onnx/model_quantized.onnx", "onnx/model.onnx", "model_quantized.onnx", "model.onnx"], "model_quantized.onnx", False, 50),
+        ([
+            "onnx/model_quantized.onnx_data",
+            "onnx/model_quantized.onnx.data",
+            "model_quantized.onnx_data",
+            "onnx/model.onnx_data",
+            "onnx/model.onnx.data",
+            "model.onnx_data"
+        ], "model_quantized.onnx_data", True, 1000),
     ]
 
     print(f"\n{CYAN}Target Directory:{RESET} {dest_dir}")
