@@ -500,8 +500,8 @@ def main():
     print_banner()
 
     cfg_state = {
-        "reranker_dir": "./ettinreranker_model",
-        "reranker_name": None,
+        "reranker_dir": f"./ettinreranker_model_{args.reranker_size}",
+        "reranker_name": f"cross-encoder/ettin-reranker-{args.reranker_size}-v1",
         "embedding_dir": "./embeddinggemma_model",
         "embedding_name": None,
         "doclaynet_dir": "./doclaynet_model",
@@ -515,23 +515,23 @@ def main():
     print(f"{BOLD}1. Ettin Cross-Encoder Reranker{RESET}")
     print(f"{DIM}Select from ultra-lightweight (17M, 32M, 68M) to flagship (150M, 400M, 1B) ONNX models.{RESET}")
 
-    default_r_dir = "./ettinreranker_model"
+    size = args.reranker_size if args.yes else prompt_choice("Select model size", ETTIN_SIZES, default="150m")
+    default_r_dir = f"./ettinreranker_model_{size}"
     target_dir = default_r_dir if args.yes else prompt_input("Target directory", default_r_dir)
     cfg_state["reranker_dir"] = target_dir
 
     exists_r = check_reranker_exists(target_dir)
     if exists_r:
-        print(f"  {GREEN}Existing Ettin Reranker weights found in {target_dir}.{RESET}")
-        dl_reranker = False if args.yes else prompt_yes_no("Re-download / update Ettin Reranker weights?", default=False)
+        print(f"  {GREEN}Existing Ettin Reranker ({size}) weights found in {target_dir}.{RESET}")
+        dl_reranker = False if args.yes else prompt_yes_no(f"Re-download / update Ettin Reranker ({size}) weights?", default=False)
     else:
-        dl_reranker = True if args.yes else prompt_yes_no("Download Ettin Reranker weights?", default=True)
+        dl_reranker = True if args.yes else prompt_yes_no(f"Download Ettin Reranker ({size}) weights?", default=True)
 
     if dl_reranker:
-        size = args.reranker_size if args.yes else prompt_choice("Select model size", ETTIN_SIZES, default="150m")
         repo_id = download_ettin_reranker(target_dir, size)
         cfg_state["reranker_name"] = repo_id or f"cross-encoder/ettin-reranker-{size}-v1"
     else:
-        cfg_state["reranker_name"] = f"cross-encoder/ettin-reranker-{args.reranker_size}-v1"
+        cfg_state["reranker_name"] = f"cross-encoder/ettin-reranker-{size}-v1"
         if not exists_r:
             print(f"  {YELLOW}Skipping Ettin Reranker download.{RESET}\n")
         else:
