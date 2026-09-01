@@ -80,9 +80,22 @@ def prompt_input(question: str, default: str) -> str:
 
 
 # ==============================================================================
-# Download Engine with Real-Time Progress Bar
+# Download Engine with Real-Time Progress Bar & Candidate Fallbacks
 # ==============================================================================
-def download_file_stream(url: str, dest_path: str, desc: str = "") -> bool:
+def is_valid_file(path: str, min_size_kb: int = 1) -> bool:
+    """Verifies that a local file exists and is larger than min_size_kb."""
+    if not os.path.isfile(path):
+        return False
+    return os.path.getsize(path) >= (min_size_kb * 1024)
+
+
+def download_file_stream(
+    url: str,
+    dest_path: str,
+    desc: str = "",
+    optional: bool = False,
+    silent_404: bool = False,
+) -> bool:
     """Downloads a file from a URL to dest_path with progress bar and LFS validation."""
     os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
     temp_path = f"{dest_path}.tmp"
@@ -136,18 +149,81 @@ def download_file_stream(url: str, dest_path: str, desc: str = "") -> bool:
         os.rename(temp_path, dest_path)
         return True
 
-    except Exception as e:
-        print(f"\n  {RED}Download error for {url}: {e}{RESET}")
+    except urllib.error.HTTPError as e:
         if os.path.exists(temp_path):
             os.remove(temp_path)
+        if not silent_404 and not optional:
+            print(f"\n  {YELLOW}HTTP Error {e.code} for {url}{RESET}")
+        return False
+    except Exception as e:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        if not silent_404 and not optional:
+            print(f"\n  {RED}Download error for {url}: {e}{RESET}")
         return False
 
 
-def is_valid_file(path: str, min_size_kb: int = 1) -> bool:
-    """Verifies that a local file exists and is larger than min_size_kb."""
-    if not os.path.isfile(path):
-        return False
-    return os.path.getsize(path) >= (min_size_kb * 1024)
+def download_file_with_candidates(
+    urls: List[str],
+    dest_path: str,
+    desc: str = "",
+    optional: bool = False,
+    min_size_kb: int = 1,
+) -> bool:
+    """Tries a list of candidate URLs in order until one succeeds."""
+    if is_valid_file(dest_path, min_size_kb=min_size_kb):
+        filename = os.path.basename(dest_path)
+        print(f"  {GREEN}Found locally:{RESET} {filename}")
+        return True
+
+    for i, url in enumerate(urls):
+        is_last = (i == len(urls) - 1)
+        silent = (not is_last) or optional
+        success = download_file_stream(url, dest_path, desc=desc, optional=optional, silent_404=silent)
+        if success:
+            return True
+
+    if optional:
+        return True
+    return False
+
+
+# ==============================================================================
+# Model Existence Validators
+# ==============================================================================
+def check_reranker_exists(dest_dir: str) -> bool:
+    """Checks if valid Ettin reranker ONNX and tokenizer files exist locally."""
+    has_onnx = any(
+        is_valid_file(os.path.join(dest_dir, f), min_size_kb=1000)
+        for f in ["model.onnx", "model_O4.onnx", "onnx/model_O4.onnx", "onnx/model.onnx"]
+    )
+    has_tok = is_valid_file(os.path.join(dest_dir, "tokenizer.json"), min_size_kb=1)
+    return has_onnx and has_tok
+
+
+def check_embedding_exists(dest_dir: str) -> bool:
+    """Checks if valid EmbeddingGemma ONNX and tokenizer files exist locally."""
+    has_onnx = any(
+        is_valid_file(os.path.join(dest_dir, f), min_size_kb=1000)
+        for f in ["model_quantized.onnx", "model.onnx", "onnx/model_quantized.onnx", "onnx/model.onnx"]
+    )
+    has_tok = is_valid_file(os.path.join(dest_dir, "tokenizer.json"), min_size_kb=1)
+    return has_onnx and has_tok
+
+
+def check_doclaynet_exists(dest_dir: str, variant: str = "yolov8x") -> bool:
+    """Checks if valid DocLayNet YOLOv8 ONNX model exists locally."""
+    onnx_file = DOCLAYNET_VARIANTS.get(variant, {}).get("onnx_file", f"{variant}-doclaynet.onnx")
+    candidates = [onnx_file, "best.onnx", "model.onnx", f"{variant}.onnx", f"{variant}-doclaynet.onnx"]
+    return any(is_valid_file(os.path.join(dest_dir, f), min_size_kb=5000) for f in candidates)
+
+
+def check_slanet_exists(dest_path_or_dir: str) -> bool:
+    """Checks if valid SLANet ONNX table model exists locally."""
+    if os.path.isfile(dest_path_or_dir):
+        return is_valid_file(dest_path_or_dir, min_size_kb=5000)
+    target = os.path.join(dest_path_or_dir, "ch_ppstructure_mobile_v2_SLANet.onnx")
+    return is_valid_file(target, min_size_kb=5000)
 
 
 # ==============================================================================
@@ -188,15 +264,16 @@ def download_ettin_reranker(dest_dir: str, size: str) -> Optional[str]:
     repo_id = f"cross-encoder/ettin-reranker-{size}-v1"
     base_url = f"https://huggingface.co/{repo_id}/resolve/main"
 
-    files_to_fetch = [
-        ("config.json", "config.json"),
-        ("tokenizer.json", "tokenizer.json"),
-        ("tokenizer_config.json", "tokenizer_config.json"),
-        ("special_tokens_map.json", "special_tokens_map.json"),
-        ("onnx/model_O4.onnx", "model.onnx"),
-        ("2_Dense/model.safetensors", "2_Dense/model.safetensors"),
-        ("3_LayerNorm/model.safetensors", "3_LayerNorm/model.safetensors"),
-        ("4_Dense/model.safetensors", "4_Dense/model.safetensors"),
+    files_spec = [
+        (["config.json"], "config.json", False, 0),
+        (["tokenizer.json"], "tokenizer.json", False, 1),
+        (["tokenizer_config.json"], "tokenizer_config.json", True, 0),
+        (["special_tokens_map.json"], "special_tokens_map.json", True, 0),
+        (["onnx/model_O4.onnx", "onnx/model.onnx", "model.onnx", "onnx/model_quantized.onnx"], "model.onnx", False, 1000),
+        (["2_Dense/model.safetensors", "dense/model.safetensors"], "2_Dense/model.safetensors", True, 10),
+        (["3_LayerNorm/model.safetensors", "layernorm/model.safetensors"], "3_LayerNorm/model.safetensors", True, 1),
+        (["4_Dense/model.safetensors", "dense_1/model.safetensors"], "4_Dense/model.safetensors", True, 1),
+        (["model.safetensors"], "model.safetensors", True, 10),
     ]
 
     print(f"\n{CYAN}Target Directory:{RESET} {dest_dir}")
@@ -205,21 +282,11 @@ def download_ettin_reranker(dest_dir: str, size: str) -> Optional[str]:
     os.makedirs(dest_dir, exist_ok=True)
     all_ok = True
 
-    for remote_subpath, local_subpath in files_to_fetch:
+    for remote_candidates, local_subpath, optional, min_kb in files_spec:
         target_path = os.path.join(dest_dir, local_subpath)
-        if is_valid_file(target_path):
-            print(f"  {GREEN}Found locally:{RESET} {local_subpath}")
-            continue
-
-        url = f"{base_url}/{remote_subpath}"
-        # Fallback for ONNX file name if model_O4 is not available
-        success = download_file_stream(url, target_path, desc=f"({local_subpath})")
-        if not success and remote_subpath == "onnx/model_O4.onnx":
-            fallback_url = f"{base_url}/onnx/model.onnx"
-            print(f"  {YELLOW}model_O4.onnx not found, trying fallback: model.onnx...{RESET}")
-            success = download_file_stream(fallback_url, target_path, desc="(model.onnx)")
-
-        if not success:
+        urls = [f"{base_url}/{p}" for p in remote_candidates]
+        ok = download_file_with_candidates(urls, target_path, desc=f"({local_subpath})", optional=optional, min_size_kb=min_kb)
+        if not ok and not optional:
             all_ok = False
 
     return repo_id if all_ok else None
@@ -230,12 +297,12 @@ def download_embedding_gemma(dest_dir: str) -> Optional[str]:
     repo_id = "onnx-community/embeddinggemma-300m-ONNX"
     base_url = f"https://huggingface.co/{repo_id}/resolve/main"
 
-    files_to_fetch = [
-        ("config.json", "config.json"),
-        ("tokenizer.json", "tokenizer.json"),
-        ("tokenizer_config.json", "tokenizer_config.json"),
-        ("special_tokens_map.json", "special_tokens_map.json"),
-        ("onnx/model_quantized.onnx", "model_quantized.onnx"),
+    files_spec = [
+        (["config.json"], "config.json", False, 0),
+        (["tokenizer.json"], "tokenizer.json", False, 1),
+        (["tokenizer_config.json"], "tokenizer_config.json", True, 0),
+        (["special_tokens_map.json"], "special_tokens_map.json", True, 0),
+        (["onnx/model_quantized.onnx", "onnx/model.onnx", "model_quantized.onnx", "model.onnx"], "model_quantized.onnx", False, 1000),
     ]
 
     print(f"\n{CYAN}Target Directory:{RESET} {dest_dir}")
@@ -244,21 +311,11 @@ def download_embedding_gemma(dest_dir: str) -> Optional[str]:
     os.makedirs(dest_dir, exist_ok=True)
     all_ok = True
 
-    for remote_subpath, local_subpath in files_to_fetch:
+    for remote_candidates, local_subpath, optional, min_kb in files_spec:
         target_path = os.path.join(dest_dir, local_subpath)
-        if is_valid_file(target_path):
-            print(f"  {GREEN}Found locally:{RESET} {local_subpath}")
-            continue
-
-        url = f"{base_url}/{remote_subpath}"
-        success = download_file_stream(url, target_path, desc=f"({local_subpath})")
-        if not success and remote_subpath == "onnx/model_quantized.onnx":
-            fallback_url = f"{base_url}/onnx/model.onnx"
-            print(f"  {YELLOW}model_quantized.onnx not found, trying fallback: model.onnx...{RESET}")
-            target_fallback = os.path.join(dest_dir, "model.onnx")
-            success = download_file_stream(fallback_url, target_fallback, desc="(model.onnx)")
-
-        if not success:
+        urls = [f"{base_url}/{p}" for p in remote_candidates]
+        ok = download_file_with_candidates(urls, target_path, desc=f"({local_subpath})", optional=optional, min_size_kb=min_kb)
+        if not ok and not optional:
             all_ok = False
 
     return "google/embeddinggemma-300m" if all_ok else None
@@ -271,9 +328,19 @@ def download_doclaynet(dest_dir: str, variant: str) -> tuple[Optional[str], Opti
     onnx_name = meta["onnx_file"]
     base_url = f"https://huggingface.co/{repo_id}/resolve/main"
 
-    files_to_fetch = [
-        ("config.json", "config.json"),
-        (onnx_name, onnx_name),
+    # Try common filename patterns found across YOLO HuggingFace repos
+    onnx_candidates = [
+        onnx_name,
+        "best.onnx",
+        "model.onnx",
+        f"{variant}.onnx",
+        f"{variant}_doclaynet.onnx",
+        "weights/best.onnx",
+    ]
+
+    files_spec = [
+        (["config.json"], "config.json", True, 0),
+        (onnx_candidates, onnx_name, False, 5000),
     ]
 
     print(f"\n{CYAN}Target Directory:{RESET} {dest_dir}")
@@ -282,15 +349,11 @@ def download_doclaynet(dest_dir: str, variant: str) -> tuple[Optional[str], Opti
     os.makedirs(dest_dir, exist_ok=True)
     all_ok = True
 
-    for remote_subpath, local_subpath in files_to_fetch:
+    for remote_candidates, local_subpath, optional, min_kb in files_spec:
         target_path = os.path.join(dest_dir, local_subpath)
-        if is_valid_file(target_path):
-            print(f"  {GREEN}Found locally:{RESET} {local_subpath}")
-            continue
-
-        url = f"{base_url}/{remote_subpath}"
-        success = download_file_stream(url, target_path, desc=f"({local_subpath})")
-        if not success:
+        urls = [f"{base_url}/{p}" for p in remote_candidates]
+        ok = download_file_with_candidates(urls, target_path, desc=f"({local_subpath})", optional=optional, min_size_kb=min_kb)
+        if not ok and not optional:
             all_ok = False
 
     return (meta["name"], repo_id) if all_ok else (None, None)
@@ -298,7 +361,6 @@ def download_doclaynet(dest_dir: str, variant: str) -> tuple[Optional[str], Opti
 
 def download_slanet(dest_dir: str) -> Optional[str]:
     """Downloads the standalone SLANet ONNX table structure recognizer."""
-    url = "https://huggingface.co/SWHL/RapidStructure/resolve/main/table/ch_ppstructure_mobile_v2_SLANet.onnx"
     filename = "ch_ppstructure_mobile_v2_SLANet.onnx"
     target_path = os.path.join(dest_dir, filename)
 
@@ -308,8 +370,12 @@ def download_slanet(dest_dir: str) -> Optional[str]:
         return target_path
 
     os.makedirs(dest_dir, exist_ok=True)
-    success = download_file_stream(url, target_path, desc="(SLANet ~7.3MB)")
-    return target_path if success else None
+    urls = [
+        "https://huggingface.co/SWHL/RapidStructure/resolve/main/table/ch_ppstructure_mobile_v2_SLANet.onnx",
+        "https://github.com/RapidAI/RapidTable/releases/download/v0.0.1/ch_ppstructure_mobile_v2_SLANet.onnx",
+    ]
+    ok = download_file_with_candidates(urls, target_path, desc="(SLANet ~7.3MB)", optional=False, min_size_kb=5000)
+    return target_path if ok else None
 
 
 # ==============================================================================
@@ -424,64 +490,113 @@ def main():
     print(f"{BOLD}1. Ettin Cross-Encoder Reranker{RESET}")
     print(f"{DIM}Select from ultra-lightweight (17M, 32M, 68M) to flagship (150M, 400M, 1B) ONNX models.{RESET}")
 
-    dl_reranker = args.yes or prompt_yes_no("Download Ettin Reranker weights?", default=True)
+    default_r_dir = "./ettinreranker_model"
+    target_dir = default_r_dir if args.yes else prompt_input("Target directory", default_r_dir)
+    cfg_state["reranker_dir"] = target_dir
+
+    exists_r = check_reranker_exists(target_dir)
+    if exists_r:
+        print(f"  {GREEN}Existing Ettin Reranker weights found in {target_dir}.{RESET}")
+        dl_reranker = False if args.yes else prompt_yes_no("Re-download / update Ettin Reranker weights?", default=False)
+    else:
+        dl_reranker = True if args.yes else prompt_yes_no("Download Ettin Reranker weights?", default=True)
+
     if dl_reranker:
         size = args.reranker_size if args.yes else prompt_choice("Select model size", ETTIN_SIZES, default="150m")
-        target_dir = "./ettinreranker_model" if args.yes else prompt_input("Target directory", "./ettinreranker_model")
-        cfg_state["reranker_dir"] = target_dir
         repo_id = download_ettin_reranker(target_dir, size)
         cfg_state["reranker_name"] = repo_id or f"cross-encoder/ettin-reranker-{size}-v1"
     else:
-        print(f"  {YELLOW}Skipping Ettin Reranker download.{RESET}\n")
+        cfg_state["reranker_name"] = f"cross-encoder/ettin-reranker-{args.reranker_size}-v1"
+        if not exists_r:
+            print(f"  {YELLOW}Skipping Ettin Reranker download.{RESET}\n")
+        else:
+            print()
 
     # --------------------------------------------------------------------------
     # 2. EmbeddingGemma Dense Vector Embeddings
     # --------------------------------------------------------------------------
-    print(f"\n{BOLD}2. EmbeddingGemma ONNX Embeddings (300M){RESET}")
+    print(f"{BOLD}2. EmbeddingGemma ONNX Embeddings (300M){RESET}")
     print(f"{DIM}Dense vector embedder providing OpenAI-compatible /v1/embeddings.{RESET}")
 
-    dl_embed = args.yes or prompt_yes_no("Download EmbeddingGemma ONNX weights?", default=True)
+    default_e_dir = "./embeddinggemma_model"
+    target_dir = default_e_dir if args.yes else prompt_input("Target directory", default_e_dir)
+    cfg_state["embedding_dir"] = target_dir
+
+    exists_e = check_embedding_exists(target_dir)
+    if exists_e:
+        print(f"  {GREEN}Existing EmbeddingGemma weights found in {target_dir}.{RESET}")
+        dl_embed = False if args.yes else prompt_yes_no("Re-download / update EmbeddingGemma weights?", default=False)
+    else:
+        dl_embed = True if args.yes else prompt_yes_no("Download EmbeddingGemma ONNX weights?", default=True)
+
     if dl_embed:
-        target_dir = "./embeddinggemma_model" if args.yes else prompt_input("Target directory", "./embeddinggemma_model")
-        cfg_state["embedding_dir"] = target_dir
         emb_name = download_embedding_gemma(target_dir)
         cfg_state["embedding_name"] = emb_name or "google/embeddinggemma-300m"
     else:
-        print(f"  {YELLOW}Skipping EmbeddingGemma download.{RESET}\n")
+        cfg_state["embedding_name"] = "google/embeddinggemma-300m"
+        if not exists_e:
+            print(f"  {YELLOW}Skipping EmbeddingGemma download.{RESET}\n")
+        else:
+            print()
 
     # --------------------------------------------------------------------------
     # 3. YOLOv8 DocLayNet Document Layout Analysis
     # --------------------------------------------------------------------------
-    print(f"\n{BOLD}3. YOLOv8 DocLayNet Document Layout Analysis{RESET}")
+    print(f"{BOLD}3. YOLOv8 DocLayNet Document Layout Analysis{RESET}")
     print(f"{DIM}Parses PDF/Image regions: Text, Titles, Tables, Headers, Footers, Pictures.{RESET}")
 
-    dl_doclaynet = args.yes or prompt_yes_no("Download YOLOv8 DocLayNet model weights?", default=True)
+    default_d_dir = "./doclaynet_model"
+    target_dir = default_d_dir if args.yes else prompt_input("Target directory", default_d_dir)
+    cfg_state["doclaynet_dir"] = target_dir
+
+    exists_d = check_doclaynet_exists(target_dir)
+    if exists_d:
+        print(f"  {GREEN}Existing DocLayNet model found in {target_dir}.{RESET}")
+        dl_doclaynet = False if args.yes else prompt_yes_no("Re-download / update DocLayNet model weights?", default=False)
+    else:
+        dl_doclaynet = True if args.yes else prompt_yes_no("Download YOLOv8 DocLayNet model weights?", default=True)
+
     if dl_doclaynet:
         variant = "yolov8x" if args.yes else prompt_choice(
             "Select YOLOv8 model variant (yolov8n=fast/light, yolov8x=highest accuracy)",
             list(DOCLAYNET_VARIANTS.keys()),
             default="yolov8x",
         )
-        target_dir = "./doclaynet_model" if args.yes else prompt_input("Target directory", "./doclaynet_model")
-        cfg_state["doclaynet_dir"] = target_dir
         doc_name, _ = download_doclaynet(target_dir, variant)
         cfg_state["doclaynet_name"] = doc_name or DOCLAYNET_VARIANTS[variant]["name"]
     else:
-        print(f"  {YELLOW}Skipping DocLayNet download.{RESET}\n")
+        cfg_state["doclaynet_name"] = "yolov8x-doclaynet"
+        if not exists_d:
+            print(f"  {YELLOW}Skipping DocLayNet download.{RESET}\n")
+        else:
+            print()
 
     # --------------------------------------------------------------------------
     # 4. SLANet Table Structure Recognition
     # --------------------------------------------------------------------------
-    print(f"\n{BOLD}4. SLANet Neural Table Recognizer{RESET}")
+    print(f"{BOLD}4. SLANet Neural Table Recognizer{RESET}")
     print(f"{DIM}Converts detected table image crops into clean HTML and Markdown tables.{RESET}")
 
-    dl_slanet = args.yes or prompt_yes_no("Download SLANet ONNX table weights (~7.3MB)?", default=True)
-    if dl_slanet:
-        target_dir = "./table_model" if args.yes else prompt_input("Target directory", "./table_model")
-        slanet_file = download_slanet(target_dir)
-        cfg_state["slanet_path"] = slanet_file or os.path.join(target_dir, "ch_ppstructure_mobile_v2_SLANet.onnx")
+    default_t_dir = "./table_model"
+    target_dir = default_t_dir if args.yes else prompt_input("Target directory", default_t_dir)
+    expected_file = os.path.join(target_dir, "ch_ppstructure_mobile_v2_SLANet.onnx")
+    cfg_state["slanet_path"] = expected_file
+
+    exists_s = check_slanet_exists(target_dir)
+    if exists_s:
+        print(f"  {GREEN}Existing SLANet model found in {target_dir}.{RESET}")
+        dl_slanet = False if args.yes else prompt_yes_no("Re-download / update SLANet ONNX table weights (~7.3MB)?", default=False)
     else:
-        print(f"  {YELLOW}Skipping SLANet download.{RESET}\n")
+        dl_slanet = True if args.yes else prompt_yes_no("Download SLANet ONNX table weights (~7.3MB)?", default=True)
+
+    if dl_slanet:
+        slanet_file = download_slanet(target_dir)
+        cfg_state["slanet_path"] = slanet_file or expected_file
+    else:
+        if not exists_s:
+            print(f"  {YELLOW}Skipping SLANet download.{RESET}\n")
+        else:
+            print()
 
     # --------------------------------------------------------------------------
     # 5. Server Settings & config.yaml Generation
