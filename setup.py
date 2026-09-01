@@ -195,8 +195,8 @@ def quantize_onnx_model(input_onnx_path: str, output_onnx_path: str) -> bool:
     """Quantizes an ONNX FP32 model to dynamic INT8 using onnxruntime.quantization."""
     try:
         from onnxruntime.quantization import quantize_dynamic, QuantType
-    except ImportError:
-        print(f"  {YELLOW}onnxruntime.quantization is not available. Skipping quantization.{RESET}")
+    except ImportError as err:
+        print(f"  {YELLOW}Quantization dependency missing ({err}). Install with: pip install onnx{RESET}")
         return False
 
     print(f"  {CYAN}Quantizing ONNX model to INT8 (dynamic)...{RESET}")
