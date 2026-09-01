@@ -330,6 +330,11 @@ def generate_yaml_config(
     slanet_path: Optional[str],
 ) -> None:
     """Generates the formatted config.yaml with detailed comments."""
+    r_dir = Path(reranker_dir).as_posix() if reranker_dir else "./ettinreranker_model"
+    e_dir = Path(embedding_dir).as_posix() if embedding_dir else "./embeddinggemma_model"
+    d_dir = Path(doclaynet_dir).as_posix() if doclaynet_dir else "./doclaynet_model"
+    s_path = f'"{Path(slanet_path).as_posix()}"' if slanet_path else "null"
+
     yaml_lines = [
         "# ==============================================================================",
         "# Ettin ONNX Reranker, EmbeddingGemma & Vision Server Configuration",
@@ -354,7 +359,7 @@ def generate_yaml_config(
         "# Reranker (Ettin Cross-Encoder) Configuration",
         "# ------------------------------------------------------------------------------",
         "reranker:",
-        f'  model_dir: "{reranker_dir if reranker_dir else "./ettinreranker_model"}"',
+        f'  model_dir: "{r_dir}"',
         "  onnx_path: null",
         f'  model_name: "{reranker_model_name if reranker_model_name else "cross-encoder/ettin-reranker-150m-v1"}"',
         "  max_length: 8192",
@@ -364,7 +369,7 @@ def generate_yaml_config(
         "# Dense Vector Embeddings (EmbeddingGemma) Configuration",
         "# ------------------------------------------------------------------------------",
         "embedding:",
-        f'  model_dir: "{embedding_dir if embedding_dir else "./embeddinggemma_model"}"',
+        f'  model_dir: "{e_dir}"',
         f'  model_name: "{embedding_model_name if embedding_model_name else "google/embeddinggemma-300m"}"',
         "  max_length: 2048",
         "  batch_size: 32",
@@ -374,14 +379,14 @@ def generate_yaml_config(
         "# ------------------------------------------------------------------------------",
         "vision:",
         "  layout:",
-        f'    model_dir: "{doclaynet_dir if doclaynet_dir else "./doclaynet_model"}"',
+        f'    model_dir: "{d_dir}"',
         f'    model_name: "{doclaynet_model_name if doclaynet_model_name else "yolov8x-doclaynet"}"',
         "    conf_threshold: 0.25",
         "    iou_threshold: 0.45",
         "    image_size: 640",
         "  table:",
         "    enable: true",
-        f'    model_path: {"\"" + slanet_path + "\"" if slanet_path else "null"}',
+        f'    model_path: {s_path}',
         "",
     ]
 
