@@ -361,6 +361,7 @@ class EttinONNXReranker:
         self,
         pairs: list[tuple[str, str]],
         batch_size: int = 32,
+        normalize: Optional[bool] = None,
     ) -> tuple[list[float], int]:
         """
         Predict relevance scores for a list of (query, document) tuples.
@@ -368,6 +369,7 @@ class EttinONNXReranker:
         if not pairs:
             return [], 0
 
+        use_normalize = self.normalize_scores if normalize is None else normalize
         all_scores = []
         total_tokens = 0
 
@@ -422,7 +424,7 @@ class EttinONNXReranker:
                 batch_scores = [float(arr)]
 
             for score in batch_scores:
-                if self.normalize_scores:
+                if use_normalize:
                     score = self._sigmoid_rescale(score)
                 all_scores.append(score)
 

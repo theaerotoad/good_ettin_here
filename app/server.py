@@ -379,6 +379,7 @@ def rerank():
     raw_docs = payload.get("documents", [])
     top_n = payload.get("top_n")
     return_documents = payload.get("return_documents", True)
+    return_raw_scores = payload.get("return_raw_scores", False)
     rank_fields = payload.get("rank_fields")
 
     if not query or not isinstance(raw_docs, list):
@@ -401,7 +402,12 @@ def rerank():
         else:
             doc_pairs.append((query, str(doc)))
 
-    scores, total_tokens = reranker_model.predict(doc_pairs, batch_size=config.BATCH_SIZE)
+    normalize_flag = not return_raw_scores if "return_raw_scores" in payload else None
+    scores, total_tokens = reranker_model.predict(
+        doc_pairs,
+        batch_size=config.BATCH_SIZE,
+        normalize=normalize_flag
+    )
 
     results = []
     for idx, (score, doc_orig) in enumerate(zip(scores, raw_docs)):

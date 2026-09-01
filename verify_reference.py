@@ -45,9 +45,14 @@ CANONICAL_TEST_CASES = [
 ]
 
 
-def query_onnx_server(server_url: str, query: str, documents: list[str]) -> list[float]:
+def query_onnx_server(server_url: str, query: str, documents: list[str], return_raw_scores: bool = True) -> list[float]:
     """Queries the Flask ONNX reranker server and returns raw scores in input document order."""
-    payload = json.dumps({"query": query, "documents": documents, "return_documents": False}).encode("utf-8")
+    payload = json.dumps({
+        "query": query,
+        "documents": documents,
+        "return_documents": False,
+        "return_raw_scores": return_raw_scores
+    }).encode("utf-8")
     req = urllib.request.Request(
         f"{server_url}/rerank",
         data=payload,
@@ -93,7 +98,7 @@ def compare_with_sentence_transformers(model_name: str, server_url: str):
         pairs = [(query, d) for d in docs]
 
         pt_scores = model.predict(pairs).tolist()
-        onnx_scores = query_onnx_server(server_url, query, docs)
+        onnx_scores = query_onnx_server(server_url, query, docs, return_raw_scores=True)
 
         all_pytorch_scores.extend(pt_scores)
         all_onnx_scores.extend(onnx_scores)
@@ -151,7 +156,7 @@ def main():
         print(f"\n--- {case['name']} ---")
         query = case["query"]
         docs = case["documents"]
-        scores = query_onnx_server(server_url, query, docs)
+        scores = query_onnx_server(server_url, query, docs, return_raw_scores=False)
 
         top_idx = max(range(len(scores)), key=lambda i: scores[i])
         expected_top = case["expected_top_index"]
