@@ -72,7 +72,17 @@ class EttinONNXReranker:
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-        logger.info(f"Initializing ONNX InferenceSession with providers: {providers}")
+        # Configure thread concurrency for optimal CPU execution
+        cpu_count = os.cpu_count() or 4
+        intra_threads = int(os.getenv("ORT_INTRA_OP_THREADS", str(cpu_count)))
+        inter_threads = int(os.getenv("ORT_INTER_OP_THREADS", "1"))
+        sess_options.intra_op_num_threads = intra_threads
+        sess_options.inter_op_num_threads = inter_threads
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
+        logger.info(
+            f"Initializing ONNX InferenceSession (intra_threads={intra_threads}, inter_threads={inter_threads}) with providers: {providers}"
+        )
         self.session = ort.InferenceSession(actual_onnx_path, sess_options, providers=providers)
         self.input_names = [inp.name for inp in self.session.get_inputs()]
         self.output_names = [out.name for out in self.session.get_outputs()]
@@ -160,8 +170,16 @@ class EttinONNXReranker:
                     return cand
 
         candidates = [
-            os.path.join(model_dir, "onnx", "model.onnx"),
-            os.path.join(model_dir, "model.onnx"),
+            os.path.join(model_dir, "model_quantized.onnx"),
+            os.path.join(model_dir, "onnx", "model_quantized.onnx"),
+            os.path.join(model_dir, "onnx", "model_qint8_avx512_vnni.onnx"),
+            os.path.join(model_dir, "model_qint8_avx512_vnni.onnx"),
+            os.path.join(model_dir, "onnx", "model_qint8_avx512.onnx"),
+            os.path.join(model_dir, "model_qint8_avx512.onnx"),
+            os.path.join(model_dir, "onnx", "model_quint8_avx2.onnx"),
+            os.path.join(model_dir, "model_quint8_avx2.onnx"),
+            os.path.join(model_dir, "onnx", "model_qint8_arm64.onnx"),
+            os.path.join(model_dir, "model_qint8_arm64.onnx"),
             os.path.join(model_dir, "onnx", "model_O4.onnx"),
             os.path.join(model_dir, "model_O4.onnx"),
             os.path.join(model_dir, "onnx", "model_O3.onnx"),
@@ -170,16 +188,8 @@ class EttinONNXReranker:
             os.path.join(model_dir, "model_O2.onnx"),
             os.path.join(model_dir, "onnx", "model_O1.onnx"),
             os.path.join(model_dir, "model_O1.onnx"),
-            os.path.join(model_dir, "onnx", "model_quint8_avx2.onnx"),
-            os.path.join(model_dir, "model_quint8_avx2.onnx"),
-            os.path.join(model_dir, "onnx", "model_qint8_avx512.onnx"),
-            os.path.join(model_dir, "model_qint8_avx512.onnx"),
-            os.path.join(model_dir, "onnx", "model_qint8_avx512_vnni.onnx"),
-            os.path.join(model_dir, "model_qint8_avx512_vnni.onnx"),
-            os.path.join(model_dir, "onnx", "model_qint8_arm64.onnx"),
-            os.path.join(model_dir, "model_qint8_arm64.onnx"),
-            os.path.join(model_dir, "model_quantized.onnx"),
-            os.path.join(model_dir, "onnx", "model_quantized.onnx"),
+            os.path.join(model_dir, "onnx", "model.onnx"),
+            os.path.join(model_dir, "model.onnx"),
         ]
 
         for cand in candidates:

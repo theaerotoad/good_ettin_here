@@ -191,11 +191,47 @@ def download_file_with_candidates(
 # ==============================================================================
 # Model Existence Validators
 # ==============================================================================
+def quantize_onnx_model(input_onnx_path: str, output_onnx_path: str) -> bool:
+    """Quantizes an ONNX FP32 model to dynamic INT8 using onnxruntime.quantization."""
+    try:
+        from onnxruntime.quantization import quantize_dynamic, QuantType
+    except ImportError:
+        print(f"  {YELLOW}onnxruntime.quantization is not available. Skipping quantization.{RESET}")
+        return False
+
+    print(f"  {CYAN}Quantizing ONNX model to INT8 (dynamic)...{RESET}")
+    print(f"  Input : {input_onnx_path} ({os.path.getsize(input_onnx_path) / (1024 * 1024):.1f} MB)")
+    try:
+        quantize_dynamic(
+            model_input=input_onnx_path,
+            model_output=output_onnx_path,
+            weight_type=QuantType.QInt8,
+            per_channel=True,
+            reduce_range=True,
+        )
+        if is_valid_file(output_onnx_path, min_size_kb=500):
+            print(f"  {GREEN}Quantized model created:{RESET} {output_onnx_path} ({os.path.getsize(output_onnx_path) / (1024 * 1024):.1f} MB)")
+            return True
+        else:
+            print(f"  {RED}Quantization output invalid or missing.{RESET}")
+            return False
+    except Exception as e:
+        print(f"  {RED}Failed to quantize model: {e}{RESET}")
+        return False
+
+
 def check_reranker_exists(dest_dir: str) -> bool:
     """Checks if valid Ettin reranker ONNX and tokenizer files exist locally."""
     has_onnx = any(
-        is_valid_file(os.path.join(dest_dir, f), min_size_kb=1000)
-        for f in ["model.onnx", "model_O4.onnx", "onnx/model_O4.onnx", "onnx/model.onnx"]
+        is_valid_file(os.path.join(dest_dir, f), min_size_kb=500)
+        for f in [
+            "model_quantized.onnx",
+            "onnx/model_quantized.onnx",
+            "model.onnx",
+            "model_O4.onnx",
+            "onnx/model_O4.onnx",
+            "onnx/model.onnx",
+        ]
     )
     has_tok = is_valid_file(os.path.join(dest_dir, "tokenizer.json"), min_size_kb=1)
     return has_onnx and has_tok
@@ -508,6 +544,7 @@ def main():
     parser.add_argument("--yes", "-y", action="store_true", help="Accept default choices for all prompts")
     parser.add_argument("--config-out", default="config.yaml", help="Destination path for generated YAML config")
     parser.add_argument("--reranker-size", choices=ETTIN_SIZES, default="150m", help="Default Ettin model size")
+    parser.add_argument("--quantize-reranker", action="store_true", help="Quantize Ettin reranker to INT8 after download")
     args = parser.parse_args()
 
     print_banner()
@@ -549,6 +586,26 @@ def main():
             print(f"  {YELLOW}Skipping Ettin Reranker download.{RESET}\n")
         else:
             print()
+
+    # Optional INT8 Dynamic Quantization for Ettin
+    quantized_path = os.path.join(target_dir, "model_quantized.onnx")
+    base_onnx_path = None
+    for cand in ["model.onnx", "model_O4.onnx", "onnx/model_O4.onnx", "onnx/model.onnx"]:
+        p = os.path.join(target_dir, cand)
+        if is_valid_file(p, min_size_kb=1000):
+            base_onnx_path = p
+            break
+
+    if is_valid_file(quantized_path, min_size_kb=500):
+        print(f"  {GREEN}Existing quantized Ettin model found:{RESET} model_quantized.onnx\n")
+    elif base_onnx_path:
+        do_quant = args.quantize_reranker if args.yes else prompt_yes_no(
+            f"Quantize Ettin Reranker ({size}) to INT8 for 2x-3x faster CPU inference?",
+            default=True,
+        )
+        if do_quant:
+            quantize_onnx_model(base_onnx_path, quantized_path)
+        print()
 
     # --------------------------------------------------------------------------
     # 2. EmbeddingGemma Dense Vector Embeddings
