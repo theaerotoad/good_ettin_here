@@ -1,0 +1,103 @@
+# ==============================================================================
+# Ettin ONNX Reranker, EmbeddingGemma & Vision Server Configuration
+# ==============================================================================
+# This configuration file centralizes all server, inference, and model settings.
+# CLI flags override any settings specified in this file.
+#
+# Usage:
+#   python app/server.py --config config.yaml
+#   python app/server.py -c example.yaml
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Server Network & Execution Settings
+# ------------------------------------------------------------------------------
+server:
+  # Host IP address to bind the Flask server to (0.0.0.0 listens on all interfaces)
+  host: "0.0.0.0"
+
+  # Port number for incoming HTTP requests
+  port: 8000
+
+  # Set to true to enable GPU execution (CUDA Execution Provider for ONNX Runtime)
+  # Set to false to force CPU execution
+  use_gpu: false
+
+# ------------------------------------------------------------------------------
+# Active Model Selector
+# ------------------------------------------------------------------------------
+# Determines which model pipelines to initialize on server startup.
+# Options:
+#   - "ettin"          : Ettin Cross-Encoder Reranker only (/v1/rerank)
+#   - "embeddinggemma" : EmbeddingGemma dense vector embedder (/v1/embeddings)
+#   - "doclaynet"      : YOLOv8 DocLayNet layout & table detection (/v1/vision/layout, /v1/vision/table)
+#   - "both"           : Both Reranker and EmbeddingGemma
+#   - "all"            : All three models (Reranker, Embedding, and DocLayNet)
+#   - "auto"           : Auto-detect and load all models found in local directories
+model_type: "auto"
+
+# ------------------------------------------------------------------------------
+# Reranker (Ettin Cross-Encoder) Configuration
+# ------------------------------------------------------------------------------
+reranker:
+  # Local directory containing Ettin ONNX files, tokenizer.json, and safetensors
+  model_dir: "./model"
+
+  # (Optional) Explicit path to a specific ONNX file variant within model_dir
+  # e.g., "onnx/model_O4.onnx", "model_qint8_arm64.onnx", or null for auto-discovery
+  onnx_path: null
+
+  # Identifier string returned in /v1/models and /v1/rerank responses
+  model_name: "cross-encoder/ettin-reranker-150m-v1"
+
+  # Maximum sequence length (tokens) for query + document pair concatenation
+  max_length: 8192
+
+  # Batch size for reranking inference
+  batch_size: 32
+
+# ------------------------------------------------------------------------------
+# Dense Vector Embeddings (EmbeddingGemma) Configuration
+# ------------------------------------------------------------------------------
+embedding:
+  # Local directory containing EmbeddingGemma ONNX model & tokenizer
+  # If null or omitted, defaults to the primary model_dir
+  model_dir: "./model/embeddinggemma"
+
+  # Identifier string returned in /v1/models and /v1/embeddings responses
+  model_name: "google/embeddinggemma-300m"
+
+  # Maximum token sequence length for input texts
+  max_length: 2048
+
+  # Batch size for embedding generation
+  batch_size: 32
+
+# ------------------------------------------------------------------------------
+# Vision & Layout Analysis (DocLayNet YOLOv8 & SLANet Table Recognition)
+# ------------------------------------------------------------------------------
+vision:
+  # DocLayNet YOLOv8 Layout Detection Settings
+  layout:
+    # Local directory containing doclaynet ONNX weights (e.g. yolov8n-doclaynet.onnx)
+    model_dir: "./model/doclaynet"
+
+    # Identifier string returned in /v1/models and vision responses
+    model_name: "yolov8n-doclaynet"
+
+    # Confidence threshold for layout object detection (0.0 to 1.0)
+    conf_threshold: 0.25
+
+    # Non-Maximum Suppression (NMS) Intersection-over-Union (IoU) threshold
+    iou_threshold: 0.45
+
+    # Square dimension (pixels) to which input images are letterboxed before YOLOv8 inference
+    image_size: 640
+
+  # Table Structure Recognition (RapidTable / SLANet ONNX) Settings
+  table:
+    # Set to true to enable automated HTML & Markdown extraction for detected tables
+    enable: true
+
+    # (Optional) Path to a specific SLANet ONNX model file. If null, automatically resolves
+    model_path: null

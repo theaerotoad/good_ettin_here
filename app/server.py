@@ -462,16 +462,39 @@ def rerank():
 
 
 def main():
+    # 1. Pre-parse configuration file argument
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("-c", "--config", type=str, default=None, help="Path to YAML configuration file")
+    pre_args, _ = pre_parser.parse_known_args()
+
+    # Load YAML configuration if specified or found at default location
+    if pre_args.config or Path("config.yaml").exists() or Path("config.yml").exists():
+        try:
+            config.load_config(pre_args.config)
+            if pre_args.config:
+                logger.info(f"Loaded configuration from {pre_args.config}")
+            elif Path("config.yaml").exists():
+                logger.info("Loaded default configuration from config.yaml")
+            elif Path("config.yml").exists():
+                logger.info("Loaded default configuration from config.yml")
+        except Exception as e:
+            logger.error(f"Failed to load configuration file: {e}")
+            sys.exit(1)
+
     parser = argparse.ArgumentParser(
         description="Ettin ONNX Reranker, Embedding, & Vision Server (Flask)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
+    # Configuration File
+    parser.add_argument("-c", "--config", type=str, default=pre_args.config, help="Path to YAML configuration file")
+
     # Server Configuration
     server_group = parser.add_argument_group("Server Configuration")
     server_group.add_argument("--host", type=str, default=config.HOST, help="Host address to bind to")
     server_group.add_argument("--port", type=int, default=config.PORT, help="Port to bind to")
-    server_group.add_argument("--use-gpu", action="store_true", default=config.USE_GPU, help="Use CUDA GPU if available")
+    server_group.add_argument("--use-gpu", action="store_true", dest="use_gpu", default=config.USE_GPU, help="Use CUDA GPU if available")
+    server_group.add_argument("--no-gpu", action="store_false", dest="use_gpu", help="Force CPU execution")
 
     # Model Loading
     model_group = parser.add_argument_group("Model Loading")
@@ -500,16 +523,17 @@ def main():
     vision_group.add_argument("--image-size", type=int, default=config.DOCLAYNET_IMAGE_SIZE, help="Input image dimension for YOLOv8")
     vision_group.add_argument("--table-model-path", type=str, default=config.TABLE_MODEL_PATH, help="Path to RapidTable / SLANet ONNX model file")
     vision_group.add_argument("--disable-table-rec", action="store_false", dest="enable_table_rec", default=config.ENABLE_TABLE_RECOGNITION, help="Disable table structure HTML/Markdown extraction")
+    vision_group.add_argument("--enable-table-rec", action="store_true", dest="enable_table_rec", help="Enable table structure HTML/Markdown extraction")
 
     args = parser.parse_args()
 
-    # Update global config
+    # Update global config with CLI overrides
     config.MODEL_TYPE = args.model_type
     config.MODEL_DIR = args.model_dir
     config.ONNX_PATH = args.onnx_path
     config.MODEL_NAME = args.model_name
-    config.EMBEDDING_MODEL_DIR = args.embedding_model_dir or args.model_dir
-    config.DOCLAYNET_MODEL_DIR = args.doclaynet_model_dir or args.model_dir
+    config.EMBEDDING_MODEL_DIR = args.embedding_model_dir or config.EMBEDDING_MODEL_DIR or args.model_dir
+    config.DOCLAYNET_MODEL_DIR = args.doclaynet_model_dir or config.DOCLAYNET_MODEL_DIR or args.model_dir
     
     config.DOCLAYNET_CONF_THRESHOLD = args.conf_threshold
     config.DOCLAYNET_IOU_THRESHOLD = args.iou_threshold
