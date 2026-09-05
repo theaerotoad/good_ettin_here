@@ -15,56 +15,56 @@ class TableRecognizerONNX:
     rapid-table or rapidocr dependencies.
     """
 
-    # Canonical 50-token vocabulary for PP-Structure SLANet (ch_ppstructure_mobile_v2_SLANet)
+    # Canonical 50-token vocabulary for PP-Structure SLANet (table_structure_dict_ch.txt + ['beg', 'end'])
     VOCAB_50 = [
-        "<html>",
-        "<body>",
-        "<table>",
         "<thead>",
+        "</thead>",
         "<tbody>",
+        "</tbody>",
         "<tr>",
+        "</tr>",
         "<td>",
         "<td",
         ">",
         "</td>",
-        "<th>",
-        "<th",
-        "</th>",
-        "</tr>",
-        "</thead>",
-        "</tbody>",
-        "</table>",
-        "</body>",
-        "</html>",
-        'colspan="2"',
-        'colspan="3"',
-        'colspan="4"',
-        'colspan="5"',
-        'colspan="6"',
-        'colspan="7"',
-        'colspan="8"',
-        'colspan="9"',
-        'colspan="10"',
-        'colspan="11"',
-        'colspan="12"',
-        'colspan="13"',
-        'colspan="14"',
-        'colspan="15"',
-        'colspan="16"',
-        'colspan="17"',
-        'colspan="18"',
-        'colspan="19"',
-        'rowspan="2"',
-        'rowspan="3"',
-        'rowspan="4"',
-        'rowspan="5"',
-        'rowspan="6"',
-        'rowspan="7"',
-        'rowspan="8"',
-        'rowspan="9"',
-        'rowspan="10"',
-        "<td></td>",
-        "<th></th>",
+        ' colspan="2"',
+        ' colspan="3"',
+        ' colspan="4"',
+        ' colspan="5"',
+        ' colspan="6"',
+        ' colspan="7"',
+        ' colspan="8"',
+        ' colspan="9"',
+        ' colspan="10"',
+        ' colspan="11"',
+        ' colspan="12"',
+        ' colspan="13"',
+        ' colspan="14"',
+        ' colspan="15"',
+        ' colspan="16"',
+        ' colspan="17"',
+        ' colspan="18"',
+        ' colspan="19"',
+        ' colspan="20"',
+        ' rowspan="2"',
+        ' rowspan="3"',
+        ' rowspan="4"',
+        ' rowspan="5"',
+        ' rowspan="6"',
+        ' rowspan="7"',
+        ' rowspan="8"',
+        ' rowspan="9"',
+        ' rowspan="10"',
+        ' rowspan="11"',
+        ' rowspan="12"',
+        ' rowspan="13"',
+        ' rowspan="14"',
+        ' rowspan="15"',
+        ' rowspan="16"',
+        ' rowspan="17"',
+        ' rowspan="18"',
+        ' rowspan="19"',
+        ' rowspan="20"',
         "beg",
         "end",
     ]
@@ -414,14 +414,22 @@ class TableRecognizerONNX:
             pass
         return None
 
-    def _preprocess_slanet(self, img_bgr: np.ndarray) -> np.ndarray:
-        """Prepares input image for SLANet: direct resize to (488, 488) and standard ImageNet normalize."""
+    def _preprocess_slanet(self, img_bgr: np.ndarray) -> tuple[np.ndarray, float]:
+        """Prepares input image for SLANet: aspect-preserving resize with padding to (488, 488)."""
         import cv2
-        resized = cv2.resize(img_bgr, self.INPUT_SHAPE, interpolation=cv2.INTER_LINEAR)
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        h, w = img_bgr.shape[:2]
+        max_edge = max(h, w)
+        scale = 488.0 / max_edge if max_edge > 0 else 1.0
+        resize_w = int(round(w * scale))
+        resize_h = int(round(h * scale))
+        resized = cv2.resize(img_bgr, (resize_w, resize_h), interpolation=cv2.INTER_LINEAR)
+        padded = np.zeros((self.INPUT_SHAPE[0], self.INPUT_SHAPE[1], 3), dtype=np.uint8)
+        padded[:resize_h, :resize_w, :] = resized
+
+        rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         normalized = (rgb - self.MEAN) / self.STD
         tensor = np.transpose(normalized, (2, 0, 1))  # HWC -> CHW
-        return np.expand_dims(tensor, axis=0).astype(np.float32)
+        return np.expand_dims(tensor, axis=0).astype(np.float32), float(max_edge)
 
     def _extract_slanet_structure(self, img_bgr: np.ndarray) -> tuple[list, list]:
         """Runs native SLANet ONNX inference and decodes HTML structure tokens and cell bboxes."""
@@ -434,7 +442,7 @@ class TableRecognizerONNX:
 
         try:
             h, w = img_bgr.shape[:2]
-            img_tensor = self._preprocess_slanet(img_bgr)
+            img_tensor, max_edge = self._preprocess_slanet(img_bgr)
             outputs = self.session.run(None, {self.input_name: img_tensor})
 
             structure_probs = None
@@ -482,7 +490,8 @@ class TableRecognizerONNX:
                 if token in ("beg", "sos"):
                     continue
 
-                if token in ("<td>", "<td></td>", "<td", "<th>", "<th></th>", "<th") and loc_preds is not None and t < len(loc_preds):
+                clean_tok = token.strip()
+                if clean_tok in ("<td>", "<td", "<td></td>", "<th>", "<th", "<th></th>") and loc_preds is not None and t < len(loc_preds):
                     raw_b = loc_preds[t]
                     if len(raw_b) == 8:
                         bx1 = float(min(raw_b[0], raw_b[2], raw_b[4], raw_b[6]))
@@ -496,19 +505,17 @@ class TableRecognizerONNX:
                     if max(bx1, by1, bx2, by2) > 1.5:
                         bx1, by1, bx2, by2 = bx1 / 488.0, by1 / 488.0, bx2 / 488.0, by2 / 488.0
 
-                    # Project normalized coords to original image dimensions
-                    real_x1 = max(0.0, min(float(w), bx1 * float(w)))
-                    real_y1 = max(0.0, min(float(h), by1 * float(h)))
-                    real_x2 = max(0.0, min(float(w), bx2 * float(w)))
-                    real_y2 = max(0.0, min(float(h), by2 * float(h)))
+                    # Unscale from padded 488x488 canvas back to original image dimensions
+                    real_x1 = max(0.0, min(float(w), bx1 * max_edge))
+                    real_y1 = max(0.0, min(float(h), by1 * max_edge))
+                    real_x2 = max(0.0, min(float(w), bx2 * max_edge))
+                    real_y2 = max(0.0, min(float(h), by2 * max_edge))
 
                     min_x, max_x = min(real_x1, real_x2), max(real_x1, real_x2)
                     min_y, max_y = min(real_y1, real_y2), max(real_y1, real_y2)
                     pred_bboxes.append([min_x, min_y, max_x, max_y])
 
                 pred_structures.append(token)
-                if token == "</html>":
-                    break
 
             logger.info(f"SLANet extracted {len(pred_structures)} structure tokens and {len(pred_bboxes)} cell bboxes.")
         except Exception as e:
@@ -674,9 +681,19 @@ class TableRecognizerONNX:
                     html_tokens.append(tag)
                     i += 1
 
-            html_output = "".join(html_tokens)
+            table_body = "".join(html_tokens)
+            if table_body:
+                if "<table" not in table_body.lower():
+                    html_output = f"<table>{table_body}</table>"
+                else:
+                    html_output = table_body
+            else:
+                html_output = ""
         elif isinstance(pred_structures, str) and pred_structures:
-            html_output = pred_structures
+            if "<table" not in pred_structures.lower():
+                html_output = f"<table>{pred_structures}</table>"
+            else:
+                html_output = pred_structures
         else:
             html_output = ""
 
@@ -684,7 +701,7 @@ class TableRecognizerONNX:
         has_text = any(bool(text.strip()) for text in cell_texts.values())
 
         # Fallback: if SLANet output was empty, invalid, or we couldn't map any text, build table rows directly from clustered OCR tokens
-        if (not html_output or "<table" not in html_output.lower() or not has_text) and ocr_tokens:
+        if (not html_output or "<table" not in html_output.lower() or not has_text or len(cell_boxes) == 0) and ocr_tokens:
             logger.warning("SLANet structure generation failed or returned no text. Triggering OCR geometric clustering fallback.")
             sorted_ocr = sorted(ocr_tokens, key=lambda t: t["bbox"][1])
             raw_rows = []
