@@ -15,9 +15,62 @@ class TableRecognizerONNX:
     rapid-table or rapidocr dependencies.
     """
 
-    # 41-token SLANet / PP-Structure table structure vocabulary
-    # In PP-Structure SLANet, 'beg' and 'end' are appended after the 39 structure tokens
-    VOCAB = [
+    # Canonical 50-token vocabulary for PP-Structure SLANet (ch_ppstructure_mobile_v2_SLANet)
+    VOCAB_50 = [
+        "<html>",
+        "<body>",
+        "<table>",
+        "<thead>",
+        "<tbody>",
+        "<tr>",
+        "<td>",
+        "<td",
+        ">",
+        "</td>",
+        "<th>",
+        "<th",
+        "</th>",
+        "</tr>",
+        "</thead>",
+        "</tbody>",
+        "</table>",
+        "</body>",
+        "</html>",
+        'colspan="2"',
+        'colspan="3"',
+        'colspan="4"',
+        'colspan="5"',
+        'colspan="6"',
+        'colspan="7"',
+        'colspan="8"',
+        'colspan="9"',
+        'colspan="10"',
+        'colspan="11"',
+        'colspan="12"',
+        'colspan="13"',
+        'colspan="14"',
+        'colspan="15"',
+        'colspan="16"',
+        'colspan="17"',
+        'colspan="18"',
+        'colspan="19"',
+        'rowspan="2"',
+        'rowspan="3"',
+        'rowspan="4"',
+        'rowspan="5"',
+        'rowspan="6"',
+        'rowspan="7"',
+        'rowspan="8"',
+        'rowspan="9"',
+        'rowspan="10"',
+        "<td></td>",
+        "<th></th>",
+        "beg",
+        "end",
+    ]
+
+    # 41-token vocabulary for English SLANet variant
+    VOCAB_41 = [
         "<html>",
         "<body>",
         "<table>",
@@ -60,6 +113,8 @@ class TableRecognizerONNX:
         "beg",
         "end",
     ]
+
+    VOCAB = VOCAB_50
 
     INPUT_SHAPE = (488, 488)
     MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -333,14 +388,22 @@ class TableRecognizerONNX:
             pass
         return None
 
-    def _preprocess_slanet(self, img_bgr: np.ndarray) -> np.ndarray:
-        """Prepares input image for SLANet: resize to (488, 488) and standard ImageNet normalize."""
+    def _preprocess_slanet(self, img_bgr: np.ndarray) -> tuple[np.ndarray, float]:
+        """Prepares input image for SLANet: aspect-preserving resize with padding to (488, 488)."""
         import cv2
-        resized = cv2.resize(img_bgr, self.INPUT_SHAPE, interpolation=cv2.INTER_LINEAR)
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        h, w = img_bgr.shape[:2]
+        max_edge = max(h, w)
+        scale = 488.0 / max_edge if max_edge > 0 else 1.0
+        resize_w = int(round(w * scale))
+        resize_h = int(round(h * scale))
+        resized = cv2.resize(img_bgr, (resize_w, resize_h), interpolation=cv2.INTER_LINEAR)
+        padded = np.zeros((self.INPUT_SHAPE[0], self.INPUT_SHAPE[1], 3), dtype=np.uint8)
+        padded[:resize_h, :resize_w, :] = resized
+
+        rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         normalized = (rgb - self.MEAN) / self.STD
         tensor = np.transpose(normalized, (2, 0, 1))  # HWC -> CHW
-        return np.expand_dims(tensor, axis=0).astype(np.float32)
+        return np.expand_dims(tensor, axis=0).astype(np.float32), scale
 
     def _extract_slanet_structure(self, img_bgr: np.ndarray) -> tuple[list, list]:
         """Runs native SLANet ONNX inference and decodes HTML structure tokens and cell bboxes."""
@@ -353,7 +416,7 @@ class TableRecognizerONNX:
 
         try:
             h, w = img_bgr.shape[:2]
-            img_tensor = self._preprocess_slanet(img_bgr)
+            img_tensor, scale = self._preprocess_slanet(img_bgr)
             outputs = self.session.run(None, {self.input_name: img_tensor})
 
             structure_probs = None
@@ -362,43 +425,68 @@ class TableRecognizerONNX:
             for out in outputs:
                 arr = np.squeeze(out)
                 if arr.ndim == 2:
-                    if arr.shape[1] == 4:
+                    # Bounding box coordinates output: shape [N, 4] or [N, 8]
+                    if arr.shape[-1] in (4, 8):
                         loc_preds = arr
-                    elif arr.shape[0] == 4:
+                    elif arr.shape[0] in (4, 8) and arr.shape[1] > 8:
                         loc_preds = arr.T
-                    elif arr.shape[1] in (30, 39, 40, 41, 42):
+                    # Structure tag probabilities output: shape [N, vocab_size]
+                    elif arr.shape[-1] > 8:
                         structure_probs = arr
-                    elif arr.shape[0] in (30, 39, 40, 41, 42):
+                    elif arr.shape[0] > 8 and arr.shape[1] <= 8:
                         structure_probs = arr.T
 
             if structure_probs is None:
                 logger.warning(f"Could not identify structure_probs from ONNX output shapes: {[o.shape for o in outputs]}")
                 return pred_structures, pred_bboxes
 
+            # Select appropriate vocabulary based on output classification dimension
+            vocab_dim = structure_probs.shape[-1]
+            if vocab_dim == 50:
+                vocab = self.VOCAB_50
+            elif vocab_dim == 41:
+                vocab = self.VOCAB_41
+            elif len(self.VOCAB) == vocab_dim:
+                vocab = self.VOCAB
+            else:
+                vocab = self.VOCAB_50 if vocab_dim >= 50 else self.VOCAB_41
+
             pred_token_indices = np.argmax(structure_probs, axis=-1)
 
             for t in range(len(pred_token_indices)):
                 idx = int(pred_token_indices[t])
-                if idx >= len(self.VOCAB):
+                if idx >= len(vocab):
                     continue
 
-                token = self.VOCAB[idx]
+                token = vocab[idx]
                 if token in ("end", "eos"):
                     break
                 if token in ("beg", "sos"):
                     continue
 
                 if token in ("<td>", "<td></td>", "<td", "<th>", "<th></th>", "<th") and loc_preds is not None and t < len(loc_preds):
-                    bbox = loc_preds[t]
-                    bx1, by1, bx2, by2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
-                    if max(bx1, by1, bx2, by2) > 1.5:
-                        bx1, by1, bx2, by2 = bx1 / 488.0, by1 / 488.0, bx2 / 488.0, by2 / 488.0
+                    raw_b = loc_preds[t]
+                    if len(raw_b) == 8:
+                        bx1 = float(min(raw_b[0], raw_b[2], raw_b[4], raw_b[6]))
+                        by1 = float(min(raw_b[1], raw_b[3], raw_b[5], raw_b[7]))
+                        bx2 = float(max(raw_b[0], raw_b[2], raw_b[4], raw_b[6]))
+                        by2 = float(max(raw_b[1], raw_b[3], raw_b[5], raw_b[7]))
+                    else:
+                        bx1, by1, bx2, by2 = float(raw_b[0]), float(raw_b[1]), float(raw_b[2]), float(raw_b[3])
 
-                    real_x1 = max(0.0, min(float(w), bx1 * w))
-                    real_y1 = max(0.0, min(float(h), by1 * h))
-                    real_x2 = max(0.0, min(float(w), bx2 * w))
-                    real_y2 = max(0.0, min(float(h), by2 * h))
-                    pred_bboxes.append([min(real_x1, real_x2), min(real_y1, real_y2), max(real_x1, real_x2), max(real_y1, real_y2)])
+                    # Convert normalized coords (0..1) to 488 canvas coords if needed
+                    if max(bx1, by1, bx2, by2) <= 1.5:
+                        bx1, by1, bx2, by2 = bx1 * 488.0, by1 * 488.0, bx2 * 488.0, by2 * 488.0
+
+                    # Unscale from padded 488x488 canvas back to original image dimensions
+                    real_x1 = max(0.0, min(float(w), bx1 / scale))
+                    real_y1 = max(0.0, min(float(h), by1 / scale))
+                    real_x2 = max(0.0, min(float(w), bx2 / scale))
+                    real_y2 = max(0.0, min(float(h), by2 / scale))
+
+                    min_x, max_x = min(real_x1, real_x2), max(real_x1, real_x2)
+                    min_y, max_y = min(real_y1, real_y2), max(real_y1, real_y2)
+                    pred_bboxes.append([min_x, min_y, max_x, max_y])
 
                 pred_structures.append(token)
                 if token == "</html>":
@@ -566,7 +654,7 @@ class TableRecognizerONNX:
         if (not html_output or "<table" not in html_output.lower() or not has_text) and ocr_tokens:
             logger.warning("SLANet structure generation failed or returned no text. Triggering OCR geometric clustering fallback.")
             sorted_ocr = sorted(ocr_tokens, key=lambda t: t["bbox"][1])
-            rows = []
+            raw_rows = []
             curr_row = []
             curr_y = None
             for t in sorted_ocr:
@@ -577,56 +665,70 @@ class TableRecognizerONNX:
                     curr_y = y_mid if curr_y is None else (curr_y + y_mid) / 2.0
                 else:
                     curr_row.sort(key=lambda item: item["bbox"][0])
-                    rows.append(curr_row)
+                    raw_rows.append(curr_row)
                     curr_row = [t]
                     curr_y = y_mid
             if curr_row:
                 curr_row.sort(key=lambda item: item["bbox"][0])
-                rows.append(curr_row)
+                raw_rows.append(curr_row)
 
-            # Determine column left edges across all rows
-            all_lefts = sorted([t["bbox"][0] for row in rows for t in row])
-            col_lefts = []
-            if all_lefts:
-                curr_c = [all_lefts[0]]
-                for x in all_lefts[1:]:
-                    if x - (sum(curr_c) / len(curr_c)) < 40.0:
-                        curr_c.append(x)
+            # Pre-merge horizontally adjacent tokens into phrase blocks within each row
+            phrase_rows = []
+            for row in raw_rows:
+                phrases = []
+                for t in row:
+                    if not phrases:
+                        phrases.append({"bbox": list(t["bbox"]), "text": t["text"]})
                     else:
-                        col_lefts.append(sum(curr_c) / len(curr_c))
-                        curr_c = [x]
-                if curr_c:
-                    col_lefts.append(sum(curr_c) / len(curr_c))
+                        prev = phrases[-1]
+                        prev_h = max(10.0, prev["bbox"][3] - prev["bbox"][1])
+                        gap = t["bbox"][0] - prev["bbox"][2]
+                        if gap < max(24.0, prev_h * 1.5):
+                            prev["bbox"][2] = max(prev["bbox"][2], t["bbox"][2])
+                            prev["bbox"][3] = max(prev["bbox"][3], t["bbox"][3])
+                            prev["text"] += " " + t["text"]
+                        else:
+                            phrases.append({"bbox": list(t["bbox"]), "text": t["text"]})
+                phrase_rows.append(phrases)
 
-            # Build column intervals [left_boundary, right_boundary]
+            # Cluster column start boundaries across rows
+            all_starts = sorted([p["bbox"][0] for row in phrase_rows for p in row])
+            col_lefts = []
+            if all_starts:
+                curr_cluster = [all_starts[0]]
+                for x in all_starts[1:]:
+                    if x - (sum(curr_cluster) / len(curr_cluster)) < 60.0:
+                        curr_cluster.append(x)
+                    else:
+                        col_lefts.append(sum(curr_cluster) / len(curr_cluster))
+                        curr_cluster = [x]
+                if curr_cluster:
+                    col_lefts.append(sum(curr_cluster) / len(curr_cluster))
+
             col_bounds = []
             for idx, c_left in enumerate(col_lefts):
                 next_left = col_lefts[idx + 1] if idx + 1 < len(col_lefts) else float("inf")
                 col_bounds.append((c_left, next_left))
 
             table_rows_html = []
-            for row in rows:
+            for row in phrase_rows:
                 col_buckets = {i: [] for i in range(len(col_bounds))}
-                for t in row:
-                    tx1 = t["bbox"][0]
-                    assigned_col = 0
-                    for c_idx, (b_start, b_end) in enumerate(col_bounds):
-                        if b_start - 25.0 <= tx1 < b_end - 25.0:
-                            assigned_col = c_idx
-                            break
-                        elif tx1 >= b_end - 25.0:
-                            assigned_col = min(c_idx + 1, len(col_bounds) - 1)
-                    col_buckets[assigned_col].append(t)
+                for p in row:
+                    px = p["bbox"][0]
+                    best_col = 0
+                    min_dist = float("inf")
+                    for c_idx, c_left in enumerate(col_lefts):
+                        dist = abs(px - c_left)
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_col = c_idx
+                    col_buckets[best_col].append(p["text"])
 
                 row_tds = []
                 for c_idx in range(len(col_bounds)):
-                    toks = col_buckets[c_idx]
-                    if toks:
-                        toks.sort(key=lambda x: x["bbox"][0])
-                        cell_str = " ".join(x["text"] for x in toks).strip()
-                        row_tds.append(f"<td>{cell_str}</td>")
-                    else:
-                        row_tds.append("<td></td>")
+                    texts = col_buckets[c_idx]
+                    cell_str = " ".join(texts).strip()
+                    row_tds.append(f"<td>{cell_str}</td>")
                 table_rows_html.append(f"<tr>{''.join(row_tds)}</tr>")
             html_output = f"<table>{''.join(table_rows_html)}</table>"
 
@@ -766,6 +868,7 @@ class TableRecognizerONNX:
             return {
                 "html": html_str or "",
                 "markdown": markdown_str or "",
+                "cell_bboxes": pred_bboxes or [],
             }
         except Exception as e:
             logger.exception("Error extracting table structure")

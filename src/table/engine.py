@@ -180,6 +180,6 @@ class TableRecognizer:
             html=res.get("html", ""),
             markdown=res.get("markdown", ""),
             elapse=elapse,
-            cell_bboxes=[],
+            cell_bboxes=res.get("cell_bboxes", []),
             raw_ocr_result=[],
         )

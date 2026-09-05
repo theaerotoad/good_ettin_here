@@ -44,7 +44,8 @@ def html_table_to_markdown(html_content: str) -> str:
                         c += 1
                     
                     text = cell.get_text(separator=" ", strip=True)
-                    text = text.replace("|", "\\|").replace("\n", " ").strip()
+                    text = " ".join(text.split())
+                    text = text.replace("|", "\\|")
                     
                     try:
                         colspan = int(cell.get("colspan", 1))

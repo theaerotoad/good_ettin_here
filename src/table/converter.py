@@ -52,7 +52,8 @@ def _convert_single_table(table_tag) -> str:
                 c += 1
 
             text = cell.get_text(separator=" ", strip=True)
-            text = text.replace("|", "\\|").replace("\n", "<br>").strip()
+            text = " ".join(text.split())
+            text = text.replace("|", "\\|")
 
             try:
                 colspan = int(cell.get("colspan", 1))
