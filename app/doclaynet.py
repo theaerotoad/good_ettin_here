@@ -483,14 +483,17 @@ class DocLayNetONNX:
                             if np.sum(gray < 85) / max(1, gray.size) > 0.6:
                                 crop = ImageOps.invert(crop)
                             
-                            # Upscale slightly for Tesseract clarity
+                            # Add white border margin so Tesseract does not clip outer glyph strokes
+                            crop = ImageOps.expand(crop, border=12, fill="white")
+
                             cw, ch = crop.size
                             if max(cw, ch) < 800:
                                 crop = crop.resize((cw * 2, ch * 2), Image.Resampling.BICUBIC)
                             
                             try:
-                                # psm 6 assumes a single uniform block of text
-                                text = pytesseract.image_to_string(crop, config='--psm 6').strip()
+                                # Use single-line PSM 7 for compact headers/titles, uniform block PSM 6 for multi-line
+                                psm_mode = "--psm 7" if (ch < 80 and det["label"] in ("Title", "Section-header")) else "--psm 6"
+                                text = pytesseract.image_to_string(crop, config=psm_mode).strip()
                                 if text:
                                     det["text"] = text
                             except Exception as e:

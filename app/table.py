@@ -297,7 +297,11 @@ class TableRecognizerONNX:
                         if not re.fullmatch(r"[-–—]+", stripped) and not re.fullmatch(r"\.{2,}", stripped):
                             continue
 
-                    text_clean = re.sub(r'([.,:;!?])([A-Za-z])', r'\1 \2', stripped)
+                    clean_str = stripped.strip("'`\"‘“”’|")
+                    if not clean_str:
+                        continue
+
+                    text_clean = re.sub(r'([.,:;!?])([A-Za-z])', r'\1 \2', clean_str)
 
                     pass_toks.append({
                         "bbox": [x1, y1, x2, y2],
@@ -306,11 +310,33 @@ class TableRecognizerONNX:
                     })
                 return pass_toks
 
+            # Add white border padding to prevent edge text misrecognition
+            pad_border = 15
+            padded_scaled_bgr = cv2.copyMakeBorder(
+                scaled_bgr, pad_border, pad_border, pad_border, pad_border, cv2.BORDER_CONSTANT, value=[255, 255, 255]
+            )
+
+            def run_padded_pass(img_arr: np.ndarray) -> list[dict]:
+                toks = run_tesseract_pass(img_arr)
+                offset = pad_border / scale_factor
+                for t in toks:
+                    t["bbox"] = [
+                        max(0.0, t["bbox"][0] - offset),
+                        max(0.0, t["bbox"][1] - offset),
+                        max(0.0, t["bbox"][2] - offset),
+                        max(0.0, t["bbox"][3] - offset),
+                    ]
+                    t["center"] = (
+                        (t["bbox"][0] + t["bbox"][2]) / 2.0,
+                        (t["bbox"][1] + t["bbox"][3]) / 2.0,
+                    )
+                return toks
+
             # Pass 1: Standard contrast (dark text on light background)
-            normal_tokens = run_tesseract_pass(scaled_bgr)
+            normal_tokens = run_padded_pass(padded_scaled_bgr)
 
             # Pass 2: Inverted contrast (white/light text on dark/colored header background)
-            negated_tokens = run_tesseract_pass(255 - scaled_bgr)
+            negated_tokens = run_padded_pass(255 - padded_scaled_bgr)
 
             # Merge and deduplicate tokens (Intersection over Min Area)
             ocr_tokens = list(normal_tokens)
@@ -388,22 +414,14 @@ class TableRecognizerONNX:
             pass
         return None
 
-    def _preprocess_slanet(self, img_bgr: np.ndarray) -> tuple[np.ndarray, float]:
-        """Prepares input image for SLANet: aspect-preserving resize with padding to (488, 488)."""
+    def _preprocess_slanet(self, img_bgr: np.ndarray) -> np.ndarray:
+        """Prepares input image for SLANet: direct resize to (488, 488) and standard ImageNet normalize."""
         import cv2
-        h, w = img_bgr.shape[:2]
-        max_edge = max(h, w)
-        scale = 488.0 / max_edge if max_edge > 0 else 1.0
-        resize_w = int(round(w * scale))
-        resize_h = int(round(h * scale))
-        resized = cv2.resize(img_bgr, (resize_w, resize_h), interpolation=cv2.INTER_LINEAR)
-        padded = np.zeros((self.INPUT_SHAPE[0], self.INPUT_SHAPE[1], 3), dtype=np.uint8)
-        padded[:resize_h, :resize_w, :] = resized
-
-        rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        resized = cv2.resize(img_bgr, self.INPUT_SHAPE, interpolation=cv2.INTER_LINEAR)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         normalized = (rgb - self.MEAN) / self.STD
         tensor = np.transpose(normalized, (2, 0, 1))  # HWC -> CHW
-        return np.expand_dims(tensor, axis=0).astype(np.float32), scale
+        return np.expand_dims(tensor, axis=0).astype(np.float32)
 
     def _extract_slanet_structure(self, img_bgr: np.ndarray) -> tuple[list, list]:
         """Runs native SLANet ONNX inference and decodes HTML structure tokens and cell bboxes."""
@@ -416,7 +434,7 @@ class TableRecognizerONNX:
 
         try:
             h, w = img_bgr.shape[:2]
-            img_tensor, scale = self._preprocess_slanet(img_bgr)
+            img_tensor = self._preprocess_slanet(img_bgr)
             outputs = self.session.run(None, {self.input_name: img_tensor})
 
             structure_probs = None
@@ -474,15 +492,15 @@ class TableRecognizerONNX:
                     else:
                         bx1, by1, bx2, by2 = float(raw_b[0]), float(raw_b[1]), float(raw_b[2]), float(raw_b[3])
 
-                    # Convert normalized coords (0..1) to 488 canvas coords if needed
-                    if max(bx1, by1, bx2, by2) <= 1.5:
-                        bx1, by1, bx2, by2 = bx1 * 488.0, by1 * 488.0, bx2 * 488.0, by2 * 488.0
+                    # Convert canvas coords (0..488) to normalized (0..1) if needed
+                    if max(bx1, by1, bx2, by2) > 1.5:
+                        bx1, by1, bx2, by2 = bx1 / 488.0, by1 / 488.0, bx2 / 488.0, by2 / 488.0
 
-                    # Unscale from padded 488x488 canvas back to original image dimensions
-                    real_x1 = max(0.0, min(float(w), bx1 / scale))
-                    real_y1 = max(0.0, min(float(h), by1 / scale))
-                    real_x2 = max(0.0, min(float(w), bx2 / scale))
-                    real_y2 = max(0.0, min(float(h), by2 / scale))
+                    # Project normalized coords to original image dimensions
+                    real_x1 = max(0.0, min(float(w), bx1 * float(w)))
+                    real_y1 = max(0.0, min(float(h), by1 * float(h)))
+                    real_x2 = max(0.0, min(float(w), bx2 * float(w)))
+                    real_y2 = max(0.0, min(float(h), by2 * float(h)))
 
                     min_x, max_x = min(real_x1, real_x2), max(real_x1, real_x2)
                     min_y, max_y = min(real_y1, real_y2), max(real_y1, real_y2)
@@ -536,12 +554,27 @@ class TableRecognizerONNX:
                 center_inside = (bx1 <= cx <= bx2) and (by1 <= cy <= by2)
 
                 score = overlap_ratio + (1.0 if center_inside else 0.0)
-                if score > best_score and (score > 0.35 or center_inside):
+                if score > best_score and (score > 0.3 or center_inside):
                     best_score = score
                     best_idx = c_idx
 
             if best_idx is not None:
                 cell_to_tokens[best_idx].append(token)
+            else:
+                # Vertical alignment fallback for tokens slightly outside detected cell boundary
+                fallback_idx = None
+                min_dist = float("inf")
+                for c_idx, norm_b in enumerate(cell_boxes):
+                    if norm_b is None:
+                        continue
+                    bx1, by1, bx2, by2 = norm_b
+                    if by1 - 5.0 <= cy <= by2 + 5.0:
+                        dist = max(0.0, bx1 - cx, cx - bx2)
+                        if dist < min_dist:
+                            min_dist = dist
+                            fallback_idx = c_idx
+                if fallback_idx is not None and min_dist < 30.0:
+                    cell_to_tokens[fallback_idx].append(token)
 
         cell_texts = {}
         for c_idx, tokens in cell_to_tokens.items():
@@ -683,7 +716,7 @@ class TableRecognizerONNX:
                         prev = phrases[-1]
                         prev_h = max(10.0, prev["bbox"][3] - prev["bbox"][1])
                         gap = t["bbox"][0] - prev["bbox"][2]
-                        if gap < max(24.0, prev_h * 1.5):
+                        if gap < min(18.0, prev_h * 0.65):
                             prev["bbox"][2] = max(prev["bbox"][2], t["bbox"][2])
                             prev["bbox"][3] = max(prev["bbox"][3], t["bbox"][3])
                             prev["text"] += " " + t["text"]
