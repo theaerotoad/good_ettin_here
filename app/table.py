@@ -16,9 +16,8 @@ class TableRecognizerONNX:
     """
 
     # 41-token SLANet / PP-Structure table structure vocabulary
+    # In PP-Structure SLANet, 'beg' and 'end' are appended after the 39 structure tokens
     VOCAB = [
-        "beg",
-        "end",
         "<html>",
         "<body>",
         "<table>",
@@ -58,6 +57,8 @@ class TableRecognizerONNX:
         'rowspan="10"',
         "<td></td>",
         "<th></th>",
+        "beg",
+        "end",
     ]
 
     INPUT_SHAPE = (488, 488)
@@ -228,7 +229,20 @@ class TableRecognizerONNX:
                     x1, y1, x2, y2 = x, y, x + bw, y + bh
 
                     import re
-                    text_clean = re.sub(r'([.,:;!?])([A-Za-z])', r'\1 \2', text_str)
+                    stripped = text_str.strip()
+                    if not stripped:
+                        continue
+
+                    # Filter out grid line segmentation noise and low-confidence punctuation
+                    if conf < 35.0 and not any(c.isalnum() for c in stripped):
+                        continue
+                    if re.fullmatch(r"[~—–`'\"|_+=^]+", stripped):
+                        continue
+                    if re.fullmatch(r"[~—–`'\"|_.\-,;:!?\s]+", stripped) and len(stripped) > 1:
+                        if not re.fullmatch(r"[-–—]+", stripped) and not re.fullmatch(r"\.{2,}", stripped):
+                            continue
+
+                    text_clean = re.sub(r'([.,:;!?])([A-Za-z])', r'\1 \2', stripped)
 
                     pass_toks.append({
                         "bbox": [x1, y1, x2, y2],
@@ -384,7 +398,7 @@ class TableRecognizerONNX:
                     real_y1 = max(0.0, min(float(h), by1 * h))
                     real_x2 = max(0.0, min(float(w), bx2 * w))
                     real_y2 = max(0.0, min(float(h), by2 * h))
-                    pred_bboxes.append([real_x1, real_y1, real_x2, real_y2])
+                    pred_bboxes.append([min(real_x1, real_x2), min(real_y1, real_y2), max(real_x1, real_x2), max(real_y1, real_y2)])
 
                 pred_structures.append(token)
                 if token == "</html>":
@@ -411,8 +425,8 @@ class TableRecognizerONNX:
             ox1, oy1, ox2, oy2 = token["bbox"]
             ocr_area = max(1.0, (ox2 - ox1) * (oy2 - oy1))
 
-            matched_idx = None
-            best_overlap = 0.0
+            best_idx = None
+            best_score = -1.0
 
             for c_idx, norm_b in enumerate(cell_boxes):
                 if norm_b is None:
@@ -420,30 +434,51 @@ class TableRecognizerONNX:
 
                 bx1, by1, bx2, by2 = norm_b
 
-                # 1. Point-in-box check (with 4px tolerance)
-                if (bx1 - 4.0) <= cx <= (bx2 + 4.0) and (by1 - 4.0) <= cy <= (by2 + 4.0):
-                    matched_idx = c_idx
-                    break
-
-                # 2. Area overlap check
+                # Compute intersection area
                 ix1 = max(bx1, ox1)
                 iy1 = max(by1, oy1)
                 ix2 = min(bx2, ox2)
                 iy2 = min(by2, oy2)
-                if ix2 > ix1 and iy2 > iy1:
-                    inter_area = (ix2 - ix1) * (iy2 - iy1)
-                    ratio = inter_area / ocr_area
-                    if ratio > best_overlap:
-                        best_overlap = ratio
-                        matched_idx = c_idx
 
-            if matched_idx is not None:
-                cell_to_tokens[matched_idx].append(token)
+                inter_w = max(0.0, ix2 - ix1)
+                inter_h = max(0.0, iy2 - iy1)
+                inter_area = inter_w * inter_h
+
+                overlap_ratio = inter_area / ocr_area
+                center_inside = (bx1 <= cx <= bx2) and (by1 <= cy <= by2)
+
+                score = overlap_ratio + (1.0 if center_inside else 0.0)
+                if score > best_score and (score > 0.35 or center_inside):
+                    best_score = score
+                    best_idx = c_idx
+
+            if best_idx is not None:
+                cell_to_tokens[best_idx].append(token)
 
         cell_texts = {}
         for c_idx, tokens in cell_to_tokens.items():
-            tokens.sort(key=lambda t: (int(t["bbox"][1] / 10.0), t["bbox"][0]))
-            cell_texts[c_idx] = " ".join(t["text"] for t in tokens).strip()
+            if not tokens:
+                continue
+            # Sort top-to-bottom, then left-to-right
+            tokens.sort(key=lambda t: (t["center"][1], t["center"][0]))
+            lines = []
+            curr_line = []
+            curr_y = None
+            for t in tokens:
+                t_y = t["center"][1]
+                t_h = max(8.0, t["bbox"][3] - t["bbox"][1])
+                if curr_y is None or abs(t_y - curr_y) < (t_h * 0.5):
+                    curr_line.append(t)
+                    curr_y = t_y if curr_y is None else (curr_y + t_y) / 2.0
+                else:
+                    curr_line.sort(key=lambda x: x["bbox"][0])
+                    lines.append(" ".join(x["text"] for x in curr_line))
+                    curr_line = [t]
+                    curr_y = t_y
+            if curr_line:
+                curr_line.sort(key=lambda x: x["bbox"][0])
+                lines.append(" ".join(x["text"] for x in curr_line))
+            cell_texts[c_idx] = " ".join(lines).strip()
 
         # Cell OCR fallback for empty cells (with dual-polarity support for dark/colored cells)
         if self.use_tesseract and img_bgr is not None:
@@ -455,8 +490,12 @@ class TableRecognizerONNX:
                     bx1, by1, bx2, by2 = norm_b
                     cx1, cy1 = max(0, int(bx1) - 2), max(0, int(by1) - 2)
                     cx2, cy2 = min(w, int(bx2) + 2), min(h, int(by2) + 2)
-                    if (cx2 - cx1) > 6 and (cy2 - cy1) > 6:
+                    if (cx2 - cx1) > 8 and (cy2 - cy1) > 8:
                         crop = img_bgr[cy1:cy2, cx1:cx2]
+                        crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                        # Skip blank/solid background cells to save latency and avoid noise
+                        if float(np.std(crop_gray)) < 7.0 or int(np.ptp(crop_gray)) < 20:
+                            continue
                         cw, ch = crop.shape[1], crop.shape[0]
                         crop_scaled = cv2.resize(crop, (max(cw * 3, 60), max(ch * 3, 30)), interpolation=cv2.INTER_CUBIC)
                         rgb_crop = cv2.cvtColor(crop_scaled, cv2.COLOR_BGR2RGB)
@@ -464,7 +503,9 @@ class TableRecognizerONNX:
                         if not txt:
                             txt = pytesseract.image_to_string(255 - rgb_crop, config="--psm 7").strip()
                         if txt:
-                            cell_texts[c_idx] = txt
+                            import re
+                            if not re.fullmatch(r"[~—–`'\"|_+=^.\-,;:!?\s]+", txt):
+                                cell_texts[c_idx] = txt
 
         # Assemble HTML table using pred_structures tokens with cell text injection
         if isinstance(pred_structures, (list, tuple)) and pred_structures:
@@ -530,7 +571,8 @@ class TableRecognizerONNX:
             curr_y = None
             for t in sorted_ocr:
                 y_mid = t["center"][1]
-                if curr_y is None or abs(y_mid - curr_y) < 18.0:
+                t_h = max(10.0, t["bbox"][3] - t["bbox"][1])
+                if curr_y is None or abs(y_mid - curr_y) < (t_h * 0.65):
                     curr_row.append(t)
                     curr_y = y_mid if curr_y is None else (curr_y + y_mid) / 2.0
                 else:
@@ -542,58 +584,49 @@ class TableRecognizerONNX:
                 curr_row.sort(key=lambda item: item["bbox"][0])
                 rows.append(curr_row)
 
-            # Merge horizontally adjacent words on the same line before column clustering
-            for row in rows:
-                merged_row = []
-                idx = 0
-                while idx < len(row):
-                    cur = dict(row[idx])
-                    while idx + 1 < len(row):
-                        nxt = row[idx + 1]
-                        gap = nxt["bbox"][0] - cur["bbox"][2]
-                        # If words are separated by normal space (< 15px), merge into single cell
-                        if 0 <= gap < 15.0:
-                            cur["text"] = f"{cur['text']} {nxt['text']}"
-                            cur["bbox"][2] = nxt["bbox"][2]
-                            cur["center"] = ((cur["bbox"][0] + cur["bbox"][2]) / 2.0, (cur["bbox"][1] + cur["bbox"][3]) / 2.0)
-                            idx += 1
-                        else:
-                            break
-                    merged_row.append(cur)
-                    idx += 1
-                row[:] = merged_row
-
-            # Cluster columns based on merged bounding box centers
-            all_x = [t["center"][0] for row in rows for t in row]
-            all_x.sort()
-
-            cols = []
-            if all_x:
-                curr_c = [all_x[0]]
-                for x in all_x[1:]:
-                    if x - (sum(curr_c) / len(curr_c)) < 35.0:
+            # Determine column left edges across all rows
+            all_lefts = sorted([t["bbox"][0] for row in rows for t in row])
+            col_lefts = []
+            if all_lefts:
+                curr_c = [all_lefts[0]]
+                for x in all_lefts[1:]:
+                    if x - (sum(curr_c) / len(curr_c)) < 40.0:
                         curr_c.append(x)
                     else:
-                        cols.append(sum(curr_c) / len(curr_c))
+                        col_lefts.append(sum(curr_c) / len(curr_c))
                         curr_c = [x]
                 if curr_c:
-                    cols.append(sum(curr_c) / len(curr_c))
+                    col_lefts.append(sum(curr_c) / len(curr_c))
+
+            # Build column intervals [left_boundary, right_boundary]
+            col_bounds = []
+            for idx, c_left in enumerate(col_lefts):
+                next_left = col_lefts[idx + 1] if idx + 1 < len(col_lefts) else float("inf")
+                col_bounds.append((c_left, next_left))
 
             table_rows_html = []
             for row in rows:
-                row_tds = []
-                col_idx = 0
+                col_buckets = {i: [] for i in range(len(col_bounds))}
                 for t in row:
-                    cx = t["center"][0]
-                    best_c = min(range(len(cols)), key=lambda i: abs(cols[i] - cx))
-                    while col_idx < best_c:
+                    tx1 = t["bbox"][0]
+                    assigned_col = 0
+                    for c_idx, (b_start, b_end) in enumerate(col_bounds):
+                        if b_start - 25.0 <= tx1 < b_end - 25.0:
+                            assigned_col = c_idx
+                            break
+                        elif tx1 >= b_end - 25.0:
+                            assigned_col = min(c_idx + 1, len(col_bounds) - 1)
+                    col_buckets[assigned_col].append(t)
+
+                row_tds = []
+                for c_idx in range(len(col_bounds)):
+                    toks = col_buckets[c_idx]
+                    if toks:
+                        toks.sort(key=lambda x: x["bbox"][0])
+                        cell_str = " ".join(x["text"] for x in toks).strip()
+                        row_tds.append(f"<td>{cell_str}</td>")
+                    else:
                         row_tds.append("<td></td>")
-                        col_idx += 1
-                    row_tds.append(f"<td>{t['text']}</td>")
-                    col_idx = max(col_idx + 1, best_c + 1)
-                while col_idx < len(cols):
-                    row_tds.append("<td></td>")
-                    col_idx += 1
                 table_rows_html.append(f"<tr>{''.join(row_tds)}</tr>")
             html_output = f"<table>{''.join(table_rows_html)}</table>"
 
@@ -704,20 +737,16 @@ class TableRecognizerONNX:
         else:
             return {"html": "", "markdown": ""}
 
-        # Scale images to a "sweet spot" resolution (longest edge ~736px)
-        # to preserve text strokes and grid lines for SLANet and OCR accuracy,
-        # while preventing OOM errors and degraded feature matching on massive crops.
+        # Ensure minimum resolution for small table crops while preserving text stroke fidelity
         try:
             import cv2
             h, w = img_bgr.shape[:2]
-            target_long_edge = 736
             max_edge = max(h, w)
-            if max_edge > 0 and abs(max_edge - target_long_edge) > 10:
-                scale = target_long_edge / max_edge
-                new_w = int(w * scale)
-                new_h = int(h * scale)
-                interp = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
-                img_bgr = cv2.resize(img_bgr, (new_w, new_h), interpolation=interp)
+            if 0 < max_edge < 600:
+                scale = 800.0 / max_edge
+                new_w = int(round(w * scale))
+                new_h = int(round(h * scale))
+                img_bgr = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
         except Exception as e:
             logger.debug(f"Could not resize table crop: {e}")
 

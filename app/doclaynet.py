@@ -444,10 +444,10 @@ class DocLayNetONNX:
         for d in detections:
             if extract_tables and self.table_recognizer is not None and d["label"].lower() == "table":
                 bx1, by1, bx2, by2 = d["bbox"]
-                cx1 = max(0, int(bx1) - 4)
-                cy1 = max(0, int(by1) - 4)
-                cx2 = min(orig_w, int(bx2) + 4)
-                cy2 = min(orig_h, int(by2) + 4)
+                cx1 = max(0, int(bx1) - 10)
+                cy1 = max(0, int(by1) - 10)
+                cx2 = min(orig_w, int(bx2) + 10)
+                cy2 = min(orig_h, int(by2) + 10)
                 if cx2 > cx1 and cy2 > cy1:
                     crop = img.crop((cx1, cy1, cx2, cy2))
                     table_data = self.table_recognizer.extract(crop)

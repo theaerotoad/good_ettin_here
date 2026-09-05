@@ -59,7 +59,7 @@ def html_table_to_markdown(html_content: str) -> str:
                     # Populate the grid coordinates covered by this cell
                     for i in range(rowspan):
                         for j in range(colspan):
-                            grid_dict[(r + i, c + j)] = text
+                            grid_dict[(r + i, c + j)] = text if (i == 0 and j == 0) else ""
                     
                     c += colspan
                 r += 1
@@ -75,6 +75,18 @@ def html_table_to_markdown(html_content: str) -> str:
             for i in range(max_r + 1):
                 row_data = [grid_dict.get((i, j), "") for j in range(max_cols)]
                 grid.append(row_data)
+
+            # Prune columns that are completely empty across all rows
+            if grid and max_cols > 0:
+                cols_with_data = [
+                    col_idx for col_idx in range(max_cols)
+                    if any(bool(grid[row_idx][col_idx].strip()) for row_idx in range(len(grid)))
+                ]
+                if cols_with_data:
+                    grid = [[row[c] for c in cols_with_data] for row in grid]
+                    max_cols = len(cols_with_data)
+                else:
+                    continue
 
             col_widths = [3] * max_cols
             for row in grid:

@@ -35,37 +35,66 @@ def html_table_to_markdown(html_content: str) -> str:
 
 def _convert_single_table(table_tag) -> str:
     """
-    Converts a single BeautifulSoup <table> tag into a Markdown table.
+    Converts a single BeautifulSoup <table> tag into a Markdown table,
+    handling colspan, rowspan, and pruning phantom empty columns.
     """
     rows = table_tag.find_all("tr")
     if not rows:
         return ""
 
-    grid: List[List[str]] = []
-    max_cols = 0
-
+    grid_dict = {}
+    r = 0
     for row in rows:
+        c = 0
         cells = row.find_all(["th", "td"])
-        row_data: List[str] = []
         for cell in cells:
-            # Clean cell text: strip whitespace and replace internal line breaks with <br>
-            cell_text = cell.get_text(separator=" ", strip=True)
-            cell_text = cell_text.replace("|", "\\|").replace("\n", "<br>")
-            row_data.append(cell_text)
+            while (r, c) in grid_dict:
+                c += 1
 
-        if row_data:
-            grid.append(row_data)
-            max_cols = max(max_cols, len(row_data))
+            text = cell.get_text(separator=" ", strip=True)
+            text = text.replace("|", "\\|").replace("\n", "<br>").strip()
 
-    if not grid or max_cols == 0:
+            try:
+                colspan = int(cell.get("colspan", 1))
+            except (ValueError, TypeError):
+                colspan = 1
+
+            try:
+                rowspan = int(cell.get("rowspan", 1))
+            except (ValueError, TypeError):
+                rowspan = 1
+
+            for i in range(rowspan):
+                for j in range(colspan):
+                    grid_dict[(r + i, c + j)] = text if (i == 0 and j == 0) else ""
+
+            c += colspan
+        r += 1
+
+    if not grid_dict:
         return ""
 
-    # Normalize row lengths to max_cols
-    for row in grid:
-        while len(row) < max_cols:
-            row.append("")
+    max_r = max(k[0] for k in grid_dict.keys())
+    max_c = max(k[1] for k in grid_dict.keys())
+    max_cols = max_c + 1
 
-    # Determine column widths for aligned formatting
+    grid = []
+    for i in range(max_r + 1):
+        row_data = [grid_dict.get((i, j), "") for j in range(max_cols)]
+        grid.append(row_data)
+
+    # Prune columns that are completely empty across all rows
+    if grid and max_cols > 0:
+        cols_with_data = [
+            col_idx for col_idx in range(max_cols)
+            if any(bool(grid[row_idx][col_idx].strip()) for row_idx in range(len(grid)))
+        ]
+        if cols_with_data:
+            grid = [[row[c] for c in cols_with_data] for row in grid]
+            max_cols = len(cols_with_data)
+        else:
+            return ""
+
     col_widths = [3] * max_cols
     for row in grid:
         for i, cell in enumerate(row):
