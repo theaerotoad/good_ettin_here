@@ -382,8 +382,21 @@ class TableRecognizerONNX:
                 logger.warning(f"Could not identify structure_probs from ONNX output shapes: {[o.shape for o in outputs]}")
                 return pred_structures, pred_bboxes
 
-            # Select appropriate vocabulary based on output classification dimension
+            # --- DIAGNOSTIC LOGGING ---
             vocab_dim = structure_probs.shape[-1]
+            logger.info("=== SLANet ONNX Diagnostic Output ===")
+            logger.info(f"Output shapes: {[o.shape for o in outputs]}")
+            logger.info(f"Detected vocab_dim: {vocab_dim}")
+            
+            raw_indices = np.argmax(structure_probs, axis=-1).flatten().tolist()
+            logger.info(f"Raw pred_token_indices (first 150): {raw_indices[:150]}")
+            
+            if loc_preds is not None:
+                logger.info(f"Raw loc_preds (first 2): {loc_preds[:2].tolist()}")
+            logger.info("=====================================")
+            # --------------------------
+
+            # Select appropriate vocabulary based on output classification dimension
             if vocab_dim == 50:
                 vocab = self.VOCAB_50
             elif vocab_dim == 41:
