@@ -353,6 +353,21 @@ class TableRecognizerONNX:
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         cl = clahe.apply(l_channel)
         enhanced_bgr = cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
+        
+        # Synthesize grid lines in solid dark regions using Canny edge detection
+        gray = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2GRAY)
+        _, dark_mask = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY_INV)
+        
+        # Connect dark blocks morphologically so we only target structural backgrounds, not thick text
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+        dark_blocks = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, kernel)
+        
+        # Detect edges and dilate to synthesize strong table grid lines
+        edges = cv2.Canny(gray, 50, 150)
+        edges = cv2.dilate(edges, np.ones((2, 2), np.uint8), iterations=1)
+        
+        # Overlay these synthesized edges as white lines within the dark blocks
+        enhanced_bgr[cv2.bitwise_and(edges, dark_blocks) > 0] = [255, 255, 255]
 
         h, w = enhanced_bgr.shape[:2]
         target_w, target_h = self.INPUT_SHAPE
@@ -586,6 +601,7 @@ class TableRecognizerONNX:
                         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                         
                         is_symbol = False
+                        symbol_char = ""
                         if contours:
                             c = max(contours, key=cv2.contourArea)
                             area = cv2.contourArea(c)
@@ -596,12 +612,19 @@ class TableRecognizerONNX:
                                 if 0.7 <= aspect <= 1.4:
                                     hull = cv2.convexHull(c)
                                     hull_area = cv2.contourArea(hull)
-                                    # High solidity means it's a filled/solid shape, not a sprawling character
-                                    if hull_area > 0 and (area / hull_area) > 0.75:
+                                    solidity = area / hull_area if hull_area > 0 else 0
+                                    
+                                    # High solidity means it's a filled/solid shape (e.g., solid dots)
+                                    if solidity > 0.75:
                                         is_symbol = True
+                                        symbol_char = "●"
+                                    # Low solidity but perfect square means hollow shape (e.g., empty rectangles)
+                                    elif solidity < 0.45 and 0.85 <= aspect <= 1.15:
+                                        is_symbol = True
+                                        symbol_char = "□"
 
                         if is_symbol:
-                            cell_texts[c_idx] = "●"
+                            cell_texts[c_idx] = symbol_char
                         else:
                             # 2. Run Tesseract OCR for text
                             crop_scaled = cv2.resize(crop, (max(cw * 3, 60), max(ch * 3, 30)), interpolation=cv2.INTER_CUBIC)
