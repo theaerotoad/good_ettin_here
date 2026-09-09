@@ -647,6 +647,9 @@ class TableRecognizerONNX:
         for k, v in cell_texts.items():
             if v:
                 cleaned = re.sub(r'(^[\s|]+)|([\s|]+$)', '', v).strip()
+                # Replace internal pipes (often grid line artifacts) with spaces to prevent Markdown table breakage
+                cleaned = cleaned.replace('|', ' ')
+                cleaned = re.sub(r'\s+', ' ', cleaned).strip()
                 cell_texts[k] = cleaned
 
         # Assemble HTML table using pred_structures tokens with cell text injection
@@ -794,6 +797,8 @@ class TableRecognizerONNX:
                     texts = col_buckets[c_idx]
                     cell_str = " ".join(texts).strip()
                     cell_str = re.sub(r'(^[\s|]+)|([\s|]+$)', '', cell_str).strip()
+                    cell_str = cell_str.replace('|', ' ')
+                    cell_str = re.sub(r'\s+', ' ', cell_str).strip()
                     row_tds.append(f"<td>{cell_str}</td>")
                 table_rows_html.append(f"<tr>{''.join(row_tds)}</tr>")
             html_output = f"<table>{''.join(table_rows_html)}</table>"
