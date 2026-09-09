@@ -653,10 +653,8 @@ class TableRecognizerONNX:
         if isinstance(pred_structures, (list, tuple)) and pred_structures:
             html_tokens = []
             
-            # Enforce <table> wrapping if missing
-            has_table_tag = any("table" in str(t).lower() for t in pred_structures)
-            if not has_table_tag:
-                html_tokens.append("<table>")
+            # Skip document-level wrapper tags; we will strictly wrap the entire sequence later
+            ignore_tags = {"<html>", "</html>", "<body>", "</body>", "<table>", "</table>", "<tbody>", "</tbody>", "<thead>", "</thead>"}
 
             cell_idx = 0
             i = 0
@@ -665,6 +663,10 @@ class TableRecognizerONNX:
                 item = pred_structures[i]
                 tag = str(item[0]) if isinstance(item, (list, tuple)) and len(item) > 0 else str(item)
                 tag_lower = tag.lower().strip()
+
+                if tag_lower in ignore_tags:
+                    i += 1
+                    continue
 
                 if tag_lower in ("<td></td>", "<th></th>"):
                     cell_tag = "td" if "td" in tag_lower else "th"
@@ -701,16 +703,14 @@ class TableRecognizerONNX:
                     html_tokens.append(tag)
                     i += 1
 
-            if not has_table_tag:
-                html_tokens.append("</table>")
-            html_output = "".join(html_tokens)
+            html_output = f"<table><tbody>{''.join(html_tokens)}</tbody></table>"
         elif isinstance(pred_structures, str) and pred_structures:
             html_output = pred_structures
         else:
             html_output = ""
 
         if html_output and "<table" not in html_output.lower():
-            html_output = f"<table>{html_output}</table>"
+            html_output = f"<table><tbody>{html_output}</tbody></table>"
 
         # Check if we successfully mapped any text into the structured table
         has_text = any(bool(text.strip()) for text in cell_texts.values())
