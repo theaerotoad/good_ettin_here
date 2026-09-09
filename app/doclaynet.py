@@ -518,9 +518,44 @@ class DocLayNetONNX:
                         try:
                             # Use single-line PSM 7 for compact headers/titles, uniform block PSM 6 for multi-line
                             psm_mode = "--psm 7" if (ch < 80 and det["label"] in ("Title", "Section-header")) else "--psm 6"
-                            text = pytesseract.image_to_string(crop, config=psm_mode).strip()
-                            if text:
-                                det["text"] = text
+
+                            data = pytesseract.image_to_data(crop, config=psm_mode, output_type=pytesseract.Output.DICT)
+
+                            lines = {}
+                            confs = []
+                            high_conf_words = 0
+
+                            for i, word in enumerate(data["text"]):
+                                word = str(word).strip()
+                                if not word: 
+                                    continue
+
+                                conf = float(data["conf"][i])
+                                if conf >= 0:
+                                    confs.append(conf)
+
+                                if conf > 60.0 and any(c.isalnum() for c in word):
+                                    high_conf_words += 1
+
+                                # Skip obvious garbage
+                                if conf < 40.0:
+                                    continue
+
+                                line_key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+                                if line_key not in lines:
+                                    lines[line_key] = []
+                                lines[line_key].append(word)
+
+                            avg_conf = sum(confs) / len(confs) if confs else 0
+
+                            # If it's an unannotated picture, aggressively filter texture hallucinations
+                            if det["label"] == "Picture":
+                                if avg_conf < 50.0 or high_conf_words < 3:
+                                    return
+
+                            text = "\n".join(" ".join(lines[k]) for k in sorted(lines.keys()))
+                            if text.strip():
+                                det["text"] = text.strip()
                         except Exception as e:
                             logger.debug(f"Tesseract extraction failed: {e}")
 
