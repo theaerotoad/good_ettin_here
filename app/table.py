@@ -415,10 +415,19 @@ class TableRecognizerONNX:
         return None
 
     def _preprocess_slanet(self, img_bgr: np.ndarray) -> np.ndarray:
-        """Prepares input image for SLANet: direct resize to (488, 488) and standard ImageNet normalize."""
+        """Prepares input image for SLANet using aspect-preserving padding."""
         import cv2
-        resized = cv2.resize(img_bgr, self.INPUT_SHAPE, interpolation=cv2.INTER_LINEAR)
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        h, w = img_bgr.shape[:2]
+        target_size = self.INPUT_SHAPE[0]
+        ratio = float(target_size) / max(h, w)
+        resize_h = int(round(h * ratio))
+        resize_w = int(round(w * ratio))
+        resized = cv2.resize(img_bgr, (resize_w, resize_h), interpolation=cv2.INTER_LINEAR)
+        
+        padded = np.zeros((target_size, target_size, 3), dtype=np.uint8)
+        padded[:resize_h, :resize_w, :] = resized
+        
+        rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         normalized = (rgb - self.MEAN) / self.STD
         tensor = np.transpose(normalized, (2, 0, 1))  # HWC -> CHW
         return np.expand_dims(tensor, axis=0).astype(np.float32)
@@ -497,10 +506,12 @@ class TableRecognizerONNX:
                         bx1, by1, bx2, by2 = bx1 / 488.0, by1 / 488.0, bx2 / 488.0, by2 / 488.0
 
                     # Project normalized coords to original image dimensions
-                    real_x1 = max(0.0, min(float(w), bx1 * float(w)))
-                    real_y1 = max(0.0, min(float(h), by1 * float(h)))
-                    real_x2 = max(0.0, min(float(w), bx2 * float(w)))
-                    real_y2 = max(0.0, min(float(h), by2 * float(h)))
+                    # Since we use aspect-preserving padding, the scale factor is max(w, h)
+                    max_dim = float(max(w, h))
+                    real_x1 = max(0.0, min(float(w), bx1 * max_dim))
+                    real_y1 = max(0.0, min(float(h), by1 * max_dim))
+                    real_x2 = max(0.0, min(float(w), bx2 * max_dim))
+                    real_y2 = max(0.0, min(float(h), by2 * max_dim))
 
                     min_x, max_x = min(real_x1, real_x2), max(real_x1, real_x2)
                     min_y, max_y = min(real_y1, real_y2), max(real_y1, real_y2)
