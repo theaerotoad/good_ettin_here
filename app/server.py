@@ -469,6 +469,7 @@ def main():
     server_group.add_argument("--port", type=int, default=config.PORT, help="Port to bind to")
     server_group.add_argument("--use-gpu", action="store_true", dest="use_gpu", default=config.USE_GPU, help="Use CUDA GPU if available")
     server_group.add_argument("--no-gpu", action="store_false", dest="use_gpu", help="Force CPU execution")
+    server_group.add_argument("--debug", action="store_true", help="Enable debug logging and raw tensor diagnostics")
 
     # Model Loading
     model_group = parser.add_argument_group("Model Loading")
@@ -520,6 +521,12 @@ def main():
     config.MAX_LENGTH = args.max_length
     config.BATCH_SIZE = args.batch_size
     config.USE_GPU = args.use_gpu
+
+    if getattr(args, "debug", False):
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger("ettin-reranker").setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
+        logger.debug("Debug logging enabled.")
 
     global reranker_model, embedding_model, doclaynet_model
     from app.model import EttinONNXReranker, EmbeddingGemmaONNX, DocLayNetONNX
