@@ -383,8 +383,18 @@ class TableRecognizerONNX:
                 logger.warning(f"Could not identify structure_probs from ONNX output shapes: {[o.shape for o in outputs]}")
                 return pred_structures, pred_bboxes
 
-            # Select appropriate vocabulary based on output classification dimension
             vocab_dim = structure_probs.shape[-1]
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("=== SLANet ONNX Diagnostic Output ===")
+                logger.debug(f"Output shapes: {[o.shape for o in outputs]}")
+                logger.debug(f"Detected vocab_dim: {vocab_dim}")
+                raw_indices = np.argmax(structure_probs, axis=-1).flatten().tolist()
+                logger.debug(f"Raw pred_token_indices (first 150): {raw_indices[:150]}")
+                if loc_preds is not None:
+                    logger.debug(f"Raw loc_preds (first 2): {loc_preds[:2].tolist()}")
+                logger.debug("=====================================")
+
+            # Select appropriate vocabulary based on output classification dimension
             if vocab_dim == 50:
                 vocab = self.VOCAB_50
             elif vocab_dim == 41:
@@ -553,6 +563,13 @@ class TableRecognizerONNX:
                             if not re.fullmatch(r"[~—–`'\"|_+=^.\-,;:!?\s]+", txt):
                                 cell_texts[c_idx] = txt
 
+        # Clean up extraneous OCR artifacts (like stray vertical pipes)
+        import re
+        for k, v in cell_texts.items():
+            if v:
+                cleaned = re.sub(r'(^[\s|]+)|([\s|]+$)', '', v).strip()
+                cell_texts[k] = cleaned
+
         # Assemble HTML table using pred_structures tokens with cell text injection
         if isinstance(pred_structures, (list, tuple)) and pred_structures:
             html_tokens = []
@@ -697,6 +714,7 @@ class TableRecognizerONNX:
                 for c_idx in range(len(col_bounds)):
                     texts = col_buckets[c_idx]
                     cell_str = " ".join(texts).strip()
+                    cell_str = re.sub(r'(^[\s|]+)|([\s|]+$)', '', cell_str).strip()
                     row_tds.append(f"<td>{cell_str}</td>")
                 table_rows_html.append(f"<tr>{''.join(row_tds)}</tr>")
             html_output = f"<table>{''.join(table_rows_html)}</table>"
