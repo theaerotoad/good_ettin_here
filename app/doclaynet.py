@@ -463,7 +463,25 @@ class DocLayNetONNX:
         # Extract text for text-like elements (excluding Pictures) if requested
         text_labels = {"Caption", "Footnote", "Formula", "List-item", "Page-footer", "Page-header", "Section-header", "Text", "Title"}
         if extract_text and (self.use_tesseract or self.ocr_engine is not None):
-            needs_ocr = any(d["label"] in text_labels for d in detections)
+            
+            # Identify Pictures that completely lack YOLO text detections inside them so we can OCR them directly
+            pictures_to_ocr = set()
+            for pic in detections:
+                if pic["label"] == "Picture":
+                    px1, py1, px2, py2 = pic["bbox"]
+                    has_text = False
+                    for t in detections:
+                        if t["label"] in text_labels:
+                            tx1, ty1, tx2, ty2 = t["bbox"]
+                            inter = max(0.0, min(px2, tx2) - max(px1, tx1)) * max(0.0, min(py2, ty2) - max(py1, ty1))
+                            tarea = max(0.0, tx2 - tx1) * max(0.0, ty2 - ty1)
+                            if tarea > 0 and inter / tarea > 0.5:
+                                has_text = True
+                                break
+                    if not has_text:
+                        pictures_to_ocr.add(id(pic))
+
+            needs_ocr = any(d["label"] in text_labels or id(d) in pictures_to_ocr for d in detections)
             
             # Tesseract Path (Superior word spacing and formatting for Latin text)
             if needs_ocr and self.use_tesseract:
@@ -476,7 +494,7 @@ class DocLayNetONNX:
                 os.environ['OMP_THREAD_LIMIT'] = '1'
 
                 def _ocr_detection(det):
-                    if det["label"] not in text_labels:
+                    if det["label"] not in text_labels and id(det) not in pictures_to_ocr:
                         return
                     bx1, by1, bx2, by2 = det["bbox"]
                     cx1, cy1 = max(0, int(bx1)), max(0, int(by1))
@@ -551,11 +569,11 @@ class DocLayNetONNX:
                     else:
                         img_bgr_ocr = img_bgr
 
-                    # Mask the image to ONLY include the specific bounding boxes detected as text.
-                    # This prevents OCR-ing the entire image (or entire figures) and reduces hallucinations.
+                    # Mask the image to ONLY include the specific bounding boxes detected as text or unannotated pictures.
+                    # This prevents OCR-ing the entire image and reduces hallucinations.
                     img_bgr_ocr_masked = np.full_like(img_bgr_ocr, 255)
                     for det in detections:
-                        if det["label"] in text_labels:
+                        if det["label"] in text_labels or id(det) in pictures_to_ocr:
                             mx1, my1, mx2, my2 = [int(v * scale_factor) for v in det["bbox"]]
                             mx1, my1 = max(0, mx1), max(0, my1)
                             mx2, my2 = min(img_bgr_ocr.shape[1], mx2), min(img_bgr_ocr.shape[0], my2)
@@ -626,7 +644,7 @@ class DocLayNetONNX:
                     
                     # Map OCR tokens to detected layout regions
                     for det in detections:
-                        if det["label"] in text_labels:
+                        if det["label"] in text_labels or id(det) in pictures_to_ocr:
                             bx1, by1, bx2, by2 = det["bbox"]
                             region_tokens = []
                             for t in ocr_tokens:
@@ -666,7 +684,13 @@ class DocLayNetONNX:
                 if pic_det["label"] == "Picture":
                     px1, py1, px2, py2 = pic_det["bbox"]
                     pic_texts = []
+                    
+                    if pic_det.get("text"):
+                        pic_texts.append(pic_det["text"].replace('\n', '\\n'))
+                        
                     for det in detections:
+                        if det is pic_det:
+                            continue
                         if det["label"] in text_labels and det.get("text"):
                             bx1, by1, bx2, by2 = det["bbox"]
                             ix1, iy1 = max(px1, bx1), max(py1, by1)
