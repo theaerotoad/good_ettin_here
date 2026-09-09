@@ -582,65 +582,76 @@ class TableRecognizerONNX:
         if self.use_tesseract and img_bgr is not None:
             import pytesseract
             import cv2
+            import os
+            import concurrent.futures
+            
+            os.environ['OMP_THREAD_LIMIT'] = '1'
             h, w = img_bgr.shape[:2]
-            for c_idx, norm_b in enumerate(cell_boxes):
-                if not cell_texts.get(c_idx) and norm_b is not None:
-                    bx1, by1, bx2, by2 = norm_b
-                    cx1, cy1 = max(0, int(bx1) - 2), max(0, int(by1) - 2)
-                    cx2, cy2 = min(w, int(bx2) + 2), min(h, int(by2) + 2)
-                    if (cx2 - cx1) > 8 and (cy2 - cy1) > 8:
-                        crop = img_bgr[cy1:cy2, cx1:cx2]
-                        crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                        # Skip blank/solid background cells to save latency and avoid noise
-                        if float(np.std(crop_gray)) < 7.0 or int(np.ptp(crop_gray)) < 20:
-                            continue
-                        cw, ch = crop.shape[1], crop.shape[0]
-                        # 1. Check for graphical symbols (e.g., dots/circles) using contour geometry
-                        blur = cv2.GaussianBlur(crop_gray, (3, 3), 0)
-                        _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-                        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        
-                        is_symbol = False
-                        symbol_char = ""
-                        if contours:
-                            c = max(contours, key=cv2.contourArea)
-                            area = cv2.contourArea(c)
-                            if area > 15:  # Ignore tiny noise
-                                x_b, y_b, cw_b, ch_b = cv2.boundingRect(c)
-                                aspect = float(cw_b) / max(1, ch_b)
-                                # Circles and squares have an aspect ratio near 1.0
-                                if 0.7 <= aspect <= 1.4:
-                                    hull = cv2.convexHull(c)
-                                    hull_area = cv2.contourArea(hull)
-                                    solidity = area / hull_area if hull_area > 0 else 0
-                                    
-                                    # High solidity means it's a filled/solid shape (e.g., solid dots)
-                                    if solidity > 0.75:
-                                        is_symbol = True
-                                        symbol_char = "●"
-                                    # Low solidity but perfect square means hollow shape (e.g., empty rectangles)
-                                    elif solidity < 0.45 and 0.85 <= aspect <= 1.15:
-                                        is_symbol = True
-                                        symbol_char = "□"
+            
+            def _process_cell(c_idx, norm_b):
+                if cell_texts.get(c_idx) or norm_b is None:
+                    return
+                bx1, by1, bx2, by2 = norm_b
+                cx1, cy1 = max(0, int(bx1) - 2), max(0, int(by1) - 2)
+                cx2, cy2 = min(w, int(bx2) + 2), min(h, int(by2) + 2)
+                if (cx2 - cx1) > 8 and (cy2 - cy1) > 8:
+                    crop = img_bgr[cy1:cy2, cx1:cx2]
+                    crop_gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                    # Skip blank/solid background cells to save latency and avoid noise
+                    if float(np.std(crop_gray)) < 7.0 or int(np.ptp(crop_gray)) < 20:
+                        return
+                    cw, ch = crop.shape[1], crop.shape[0]
+                    
+                    # 1. Check for graphical symbols (e.g., dots/circles) using contour geometry
+                    blur = cv2.GaussianBlur(crop_gray, (3, 3), 0)
+                    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+                    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    
+                    is_symbol = False
+                    symbol_char = ""
+                    if contours:
+                        c = max(contours, key=cv2.contourArea)
+                        area = cv2.contourArea(c)
+                        if area > 15:  # Ignore tiny noise
+                            x_b, y_b, cw_b, ch_b = cv2.boundingRect(c)
+                            aspect = float(cw_b) / max(1, ch_b)
+                            # Circles and squares have an aspect ratio near 1.0
+                            if 0.7 <= aspect <= 1.4:
+                                hull = cv2.convexHull(c)
+                                hull_area = cv2.contourArea(hull)
+                                solidity = area / hull_area if hull_area > 0 else 0
+                                
+                                # High solidity means it's a filled/solid shape (e.g., solid dots)
+                                if solidity > 0.75:
+                                    is_symbol = True
+                                    symbol_char = "●"
+                                # Low solidity but perfect square means hollow shape (e.g., empty rectangles)
+                                elif solidity < 0.45 and 0.85 <= aspect <= 1.15:
+                                    is_symbol = True
+                                    symbol_char = "□"
 
-                        if is_symbol:
-                            cell_texts[c_idx] = symbol_char
-                        else:
-                            # 2. Run Tesseract OCR for text
-                            crop_scaled = cv2.resize(crop, (max(cw * 3, 60), max(ch * 3, 30)), interpolation=cv2.INTER_CUBIC)
-                            rgb_crop = cv2.cvtColor(crop_scaled, cv2.COLOR_BGR2RGB)
-                            txt = pytesseract.image_to_string(rgb_crop, config="--psm 7").strip()
-                            if not txt:
-                                txt = pytesseract.image_to_string(255 - rgb_crop, config="--psm 7").strip()
-                            
-                            if txt:
-                                import re
-                                if not re.fullmatch(r"[~—–`'\"|_+=^.\-,;:!?\s]+", txt):
-                                    # Aggressively filter out 1-2 char hallucinated symbol noise
-                                    if len(txt) <= 2 and not any(ch.isalnum() for ch in txt):
-                                        pass
-                                    else:
-                                        cell_texts[c_idx] = txt
+                    if is_symbol:
+                        cell_texts[c_idx] = symbol_char
+                    else:
+                        # 2. Run Tesseract OCR for text
+                        crop_scaled = cv2.resize(crop, (max(cw * 3, 60), max(ch * 3, 30)), interpolation=cv2.INTER_CUBIC)
+                        rgb_crop = cv2.cvtColor(crop_scaled, cv2.COLOR_BGR2RGB)
+                        txt = pytesseract.image_to_string(rgb_crop, config="--psm 7").strip()
+                        if not txt:
+                            txt = pytesseract.image_to_string(255 - rgb_crop, config="--psm 7").strip()
+                        
+                        if txt:
+                            import re
+                            if not re.fullmatch(r"[~—–`'\"|_+=^.\-,;:!?\s]+", txt):
+                                # Aggressively filter out 1-2 char hallucinated symbol noise
+                                if len(txt) <= 2 and not any(ch.isalnum() for ch in txt):
+                                    pass
+                                else:
+                                    cell_texts[c_idx] = txt
+
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = [executor.submit(_process_cell, c_idx, norm_b) for c_idx, norm_b in enumerate(cell_boxes)]
+                concurrent.futures.wait(futures)
 
         # Clean up extraneous OCR artifacts (like stray vertical pipes)
         import re

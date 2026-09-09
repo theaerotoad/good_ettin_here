@@ -469,35 +469,45 @@ class DocLayNetONNX:
             if needs_ocr and self.use_tesseract:
                 import pytesseract
                 from PIL import ImageOps
-                for det in detections:
-                    if det["label"] in text_labels:
-                        bx1, by1, bx2, by2 = det["bbox"]
-                        cx1, cy1 = max(0, int(bx1)), max(0, int(by1))
-                        cx2, cy2 = min(orig_w, int(bx2)), min(orig_h, int(by2))
-                        
-                        if cx2 > cx1 and cy2 > cy1:
-                            crop = img.crop((cx1, cy1, cx2, cy2))
-                            
-                            # Invert crop if it's predominantly dark (white text on dark background)
-                            gray = np.dot(np.array(crop)[..., :3], [0.114, 0.587, 0.299])
-                            if np.sum(gray < 85) / max(1, gray.size) > 0.6:
-                                crop = ImageOps.invert(crop)
-                            
-                            # Add white border margin so Tesseract does not clip outer glyph strokes
-                            crop = ImageOps.expand(crop, border=12, fill="white")
+                import os
+                import concurrent.futures
 
-                            cw, ch = crop.size
-                            if max(cw, ch) < 800:
-                                crop = crop.resize((cw * 2, ch * 2), Image.Resampling.BICUBIC)
-                            
-                            try:
-                                # Use single-line PSM 7 for compact headers/titles, uniform block PSM 6 for multi-line
-                                psm_mode = "--psm 7" if (ch < 80 and det["label"] in ("Title", "Section-header")) else "--psm 6"
-                                text = pytesseract.image_to_string(crop, config=psm_mode).strip()
-                                if text:
-                                    det["text"] = text
-                            except Exception as e:
-                                logger.debug(f"Tesseract extraction failed: {e}")
+                # Prevent Tesseract from spawning too many threads per instance and thrashing CPU
+                os.environ['OMP_THREAD_LIMIT'] = '1'
+
+                def _ocr_detection(det):
+                    if det["label"] not in text_labels:
+                        return
+                    bx1, by1, bx2, by2 = det["bbox"]
+                    cx1, cy1 = max(0, int(bx1)), max(0, int(by1))
+                    cx2, cy2 = min(orig_w, int(bx2)), min(orig_h, int(by2))
+                    
+                    if cx2 > cx1 and cy2 > cy1:
+                        crop = img.crop((cx1, cy1, cx2, cy2))
+                        
+                        # Invert crop if it's predominantly dark (white text on dark background)
+                        gray = np.dot(np.array(crop)[..., :3], [0.114, 0.587, 0.299])
+                        if np.sum(gray < 85) / max(1, gray.size) > 0.6:
+                            crop = ImageOps.invert(crop)
+                        
+                        # Add white border margin so Tesseract does not clip outer glyph strokes
+                        crop = ImageOps.expand(crop, border=12, fill="white")
+
+                        cw, ch = crop.size
+                        if max(cw, ch) < 800:
+                            crop = crop.resize((cw * 2, ch * 2), Image.Resampling.BICUBIC)
+                        
+                        try:
+                            # Use single-line PSM 7 for compact headers/titles, uniform block PSM 6 for multi-line
+                            psm_mode = "--psm 7" if (ch < 80 and det["label"] in ("Title", "Section-header")) else "--psm 6"
+                            text = pytesseract.image_to_string(crop, config=psm_mode).strip()
+                            if text:
+                                det["text"] = text
+                        except Exception as e:
+                            logger.debug(f"Tesseract extraction failed: {e}")
+
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    list(executor.map(_ocr_detection, detections))
 
             # RapidOCR Fallback Path (Portable, no system binaries)
             elif needs_ocr and self.ocr_engine is not None:
