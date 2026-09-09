@@ -15,106 +15,28 @@ class TableRecognizerONNX:
     rapid-table or rapidocr dependencies.
     """
 
-    # Canonical 50-token vocabulary for PP-Structure SLANet (ch_ppstructure_mobile_v2_SLANet)
-    VOCAB_50 = [
-        "<html>",
-        "<body>",
-        "<table>",
-        "<thead>",
-        "<tbody>",
-        "<tr>",
-        "<td>",
-        "<td",
-        ">",
-        "</td>",
-        "<th>",
-        "<th",
-        "</th>",
-        "</tr>",
-        "</thead>",
-        "</tbody>",
-        "</table>",
-        "</body>",
-        "</html>",
-        'colspan="2"',
-        'colspan="3"',
-        'colspan="4"',
-        'colspan="5"',
-        'colspan="6"',
-        'colspan="7"',
-        'colspan="8"',
-        'colspan="9"',
-        'colspan="10"',
-        'colspan="11"',
-        'colspan="12"',
-        'colspan="13"',
-        'colspan="14"',
-        'colspan="15"',
-        'colspan="16"',
-        'colspan="17"',
-        'colspan="18"',
-        'colspan="19"',
-        'rowspan="2"',
-        'rowspan="3"',
-        'rowspan="4"',
-        'rowspan="5"',
-        'rowspan="6"',
-        'rowspan="7"',
-        'rowspan="8"',
-        'rowspan="9"',
-        'rowspan="10"',
-        "<td></td>",
-        "<th></th>",
-        "beg",
-        "end",
+    # Standard 37-token vocabulary for RapidTable / PP-Structure SLANet
+    VOCAB_RAPIDTABLE = [
+        "beg", "<html>", "<body>", "<table>", "<thead>", "<tbody>", "<tr>", "<td>", "</td>", "</tr>",
+        "</thead>", "</tbody>", "</table>", "</body>", "</html>", "<td></td>", "<td", ">",
+        ' colspan="2"', ' colspan="3"', ' colspan="4"', ' colspan="5"', ' colspan="6"', ' colspan="7"',
+        ' colspan="8"', ' colspan="9"', ' colspan="10"', ' rowspan="2"', ' rowspan="3"', ' rowspan="4"',
+        ' rowspan="5"', ' rowspan="6"', ' rowspan="7"', ' rowspan="8"', ' rowspan="9"', ' rowspan="10"',
+        "end"
     ]
 
-    # 41-token vocabulary for English SLANet variant
-    VOCAB_41 = [
-        "<html>",
-        "<body>",
-        "<table>",
-        "<thead>",
-        "<tbody>",
-        "<tr>",
-        "<td>",
-        "<td",
-        ">",
-        "</td>",
-        "<th>",
-        "<th",
-        "</th>",
-        "</tr>",
-        "</thead>",
-        "</tbody>",
-        "</table>",
-        "</body>",
-        "</html>",
-        'colspan="2"',
-        'colspan="3"',
-        'colspan="4"',
-        'colspan="5"',
-        'colspan="6"',
-        'colspan="7"',
-        'colspan="8"',
-        'colspan="9"',
-        'colspan="10"',
-        'rowspan="2"',
-        'rowspan="3"',
-        'rowspan="4"',
-        'rowspan="5"',
-        'rowspan="6"',
-        'rowspan="7"',
-        'rowspan="8"',
-        'rowspan="9"',
-        'rowspan="10"',
-        "<td></td>",
-        "<th></th>",
-        "beg",
-        "end",
+    # Extended vocabulary for complex tables
+    VOCAB_EXT = [
+        "beg", "<html>", "<body>", "<table>", "<thead>", "<tbody>", "<tr>", "<td>", "</td>", "</tr>",
+        "</thead>", "</tbody>", "</table>", "</body>", "</html>", "<td></td>", "<td", ">",
+        ' colspan="2"', ' colspan="3"', ' colspan="4"', ' colspan="5"', ' colspan="6"', ' colspan="7"',
+        ' colspan="8"', ' colspan="9"', ' colspan="10"', ' colspan="11"', ' colspan="12"', ' colspan="13"',
+        ' colspan="14"', ' colspan="15"', ' colspan="16"', ' colspan="17"', ' colspan="18"', ' colspan="19"',
+        ' rowspan="2"', ' rowspan="3"', ' rowspan="4"', ' rowspan="5"', ' rowspan="6"', ' rowspan="7"',
+        ' rowspan="8"', ' rowspan="9"', ' rowspan="10"', "<th>", "</th>", "<th></th>", "<th", "end"
     ]
 
-    VOCAB = VOCAB_50
+    VOCAB = VOCAB_RAPIDTABLE
 
     INPUT_SHAPE = (488, 488)
     MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -415,19 +337,10 @@ class TableRecognizerONNX:
         return None
 
     def _preprocess_slanet(self, img_bgr: np.ndarray) -> np.ndarray:
-        """Prepares input image for SLANet using aspect-preserving padding."""
+        """Prepares input image for SLANet: direct resize to (488, 488) and standard ImageNet normalize."""
         import cv2
-        h, w = img_bgr.shape[:2]
-        target_size = self.INPUT_SHAPE[0]
-        ratio = float(target_size) / max(h, w)
-        resize_h = int(round(h * ratio))
-        resize_w = int(round(w * ratio))
-        resized = cv2.resize(img_bgr, (resize_w, resize_h), interpolation=cv2.INTER_LINEAR)
-        
-        padded = np.zeros((target_size, target_size, 3), dtype=np.uint8)
-        padded[:resize_h, :resize_w, :] = resized
-        
-        rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        resized = cv2.resize(img_bgr, self.INPUT_SHAPE, interpolation=cv2.INTER_LINEAR)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         normalized = (rgb - self.MEAN) / self.STD
         tensor = np.transpose(normalized, (2, 0, 1))  # HWC -> CHW
         return np.expand_dims(tensor, axis=0).astype(np.float32)
@@ -469,14 +382,14 @@ class TableRecognizerONNX:
 
             # Select appropriate vocabulary based on output classification dimension
             vocab_dim = structure_probs.shape[-1]
-            if vocab_dim == 50:
-                vocab = self.VOCAB_50
-            elif vocab_dim == 41:
-                vocab = self.VOCAB_41
-            elif len(self.VOCAB) == vocab_dim:
-                vocab = self.VOCAB
+            if vocab_dim > len(self.VOCAB_RAPIDTABLE) and vocab_dim >= 45:
+                vocab = self.VOCAB_EXT.copy()
             else:
-                vocab = self.VOCAB_50 if vocab_dim >= 50 else self.VOCAB_41
+                vocab = self.VOCAB_RAPIDTABLE.copy()
+            
+            # Pad vocabulary to avoid index out of bounds
+            while len(vocab) < vocab_dim:
+                vocab.append("pad")
 
             pred_token_indices = np.argmax(structure_probs, axis=-1)
 
@@ -506,12 +419,10 @@ class TableRecognizerONNX:
                         bx1, by1, bx2, by2 = bx1 / 488.0, by1 / 488.0, bx2 / 488.0, by2 / 488.0
 
                     # Project normalized coords to original image dimensions
-                    # Since we use aspect-preserving padding, the scale factor is max(w, h)
-                    max_dim = float(max(w, h))
-                    real_x1 = max(0.0, min(float(w), bx1 * max_dim))
-                    real_y1 = max(0.0, min(float(h), by1 * max_dim))
-                    real_x2 = max(0.0, min(float(w), bx2 * max_dim))
-                    real_y2 = max(0.0, min(float(h), by2 * max_dim))
+                    real_x1 = max(0.0, min(float(w), bx1 * float(w)))
+                    real_y1 = max(0.0, min(float(h), by1 * float(h)))
+                    real_x2 = max(0.0, min(float(w), bx2 * float(w)))
+                    real_y2 = max(0.0, min(float(h), by2 * float(h)))
 
                     min_x, max_x = min(real_x1, real_x2), max(real_x1, real_x2)
                     min_y, max_y = min(real_y1, real_y2), max(real_y1, real_y2)
@@ -642,6 +553,12 @@ class TableRecognizerONNX:
         # Assemble HTML table using pred_structures tokens with cell text injection
         if isinstance(pred_structures, (list, tuple)) and pred_structures:
             html_tokens = []
+            
+            # Enforce <table> wrapping if missing
+            has_table_tag = any("table" in str(t).lower() for t in pred_structures)
+            if not has_table_tag:
+                html_tokens.append("<table>")
+
             cell_idx = 0
             i = 0
             n = len(pred_structures)
@@ -685,11 +602,16 @@ class TableRecognizerONNX:
                     html_tokens.append(tag)
                     i += 1
 
+            if not has_table_tag:
+                html_tokens.append("</table>")
             html_output = "".join(html_tokens)
         elif isinstance(pred_structures, str) and pred_structures:
             html_output = pred_structures
         else:
             html_output = ""
+
+        if html_output and "<table" not in html_output.lower():
+            html_output = f"<table>{html_output}</table>"
 
         # Check if we successfully mapped any text into the structured table
         has_text = any(bool(text.strip()) for text in cell_texts.values())
