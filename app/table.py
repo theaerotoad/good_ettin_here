@@ -339,14 +339,32 @@ class TableRecognizerONNX:
             pass
         return None
 
-    def _preprocess_slanet(self, img_bgr: np.ndarray) -> np.ndarray:
-        """Prepares input image for SLANet: direct resize to (488, 488) and standard ImageNet normalize."""
+    def _preprocess_slanet(self, img_bgr: np.ndarray) -> tuple[np.ndarray, float]:
+        """
+        Prepares input image for SLANet: aspect-preserving resize with padding to (488, 488)
+        and standard ImageNet normalize. Returns (tensor, ratio).
+        """
         import cv2
-        resized = cv2.resize(img_bgr, self.INPUT_SHAPE, interpolation=cv2.INTER_LINEAR)
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        h, w = img_bgr.shape[:2]
+        target_w, target_h = self.INPUT_SHAPE
+        
+        ratio = min(target_w / w, target_h / h)
+        new_w = int(w * ratio)
+        new_h = int(h * ratio)
+        
+        resized = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        
+        pad_w = target_w - new_w
+        pad_h = target_h - new_h
+        
+        padded = cv2.copyMakeBorder(
+            resized, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(255, 255, 255)
+        )
+        
+        rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         normalized = (rgb - self.MEAN) / self.STD
         tensor = np.transpose(normalized, (2, 0, 1))  # HWC -> CHW
-        return np.expand_dims(tensor, axis=0).astype(np.float32)
+        return np.expand_dims(tensor, axis=0).astype(np.float32), ratio
 
     def _extract_slanet_structure(self, img_bgr: np.ndarray) -> tuple[list, list]:
         """Runs native SLANet ONNX inference and decodes HTML structure tokens and cell bboxes."""
@@ -359,7 +377,7 @@ class TableRecognizerONNX:
 
         try:
             h, w = img_bgr.shape[:2]
-            img_tensor = self._preprocess_slanet(img_bgr)
+            img_tensor, ratio = self._preprocess_slanet(img_bgr)
             outputs = self.session.run(None, {self.input_name: img_tensor})
 
             structure_probs = None
@@ -427,15 +445,15 @@ class TableRecognizerONNX:
                     else:
                         bx1, by1, bx2, by2 = float(raw_b[0]), float(raw_b[1]), float(raw_b[2]), float(raw_b[3])
 
-                    # Convert canvas coords (0..488) to normalized (0..1) if needed
-                    if max(bx1, by1, bx2, by2) > 1.5:
-                        bx1, by1, bx2, by2 = bx1 / 488.0, by1 / 488.0, bx2 / 488.0, by2 / 488.0
+                    # Denormalize if model outputs 0..1 coordinates
+                    if max(bx1, by1, bx2, by2) <= 1.5:
+                        bx1, by1, bx2, by2 = bx1 * 488.0, by1 * 488.0, bx2 * 488.0, by2 * 488.0
 
-                    # Project normalized coords to original image dimensions
-                    real_x1 = max(0.0, min(float(w), bx1 * float(w)))
-                    real_y1 = max(0.0, min(float(h), by1 * float(h)))
-                    real_x2 = max(0.0, min(float(w), bx2 * float(w)))
-                    real_y2 = max(0.0, min(float(h), by2 * float(h)))
+                    # Remove padding and reverse aspect-preserving scale to project to original image
+                    real_x1 = max(0.0, min(float(w), bx1 / ratio))
+                    real_y1 = max(0.0, min(float(h), by1 / ratio))
+                    real_x2 = max(0.0, min(float(w), bx2 / ratio))
+                    real_y2 = max(0.0, min(float(h), by2 / ratio))
 
                     min_x, max_x = min(real_x1, real_x2), max(real_x1, real_x2)
                     min_y, max_y = min(real_y1, real_y2), max(real_y1, real_y2)
