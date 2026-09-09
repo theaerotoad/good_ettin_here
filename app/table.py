@@ -341,18 +341,27 @@ class TableRecognizerONNX:
 
     def _preprocess_slanet(self, img_bgr: np.ndarray) -> tuple[np.ndarray, float]:
         """
-        Prepares input image for SLANet: aspect-preserving resize with padding to (488, 488)
-        and standard ImageNet normalize. Returns (tensor, ratio).
+        Prepares input image for SLANet: applies CLAHE to expose grid lines in dark headers,
+        aspect-preserving resize with padding to (488, 488), and standard ImageNet normalize.
+        Returns (tensor, ratio).
         """
         import cv2
-        h, w = img_bgr.shape[:2]
+        
+        # Enhance local contrast so SLANet can "see" grid lines hidden in dark headers
+        lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+        l_channel, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        cl = clahe.apply(l_channel)
+        enhanced_bgr = cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
+
+        h, w = enhanced_bgr.shape[:2]
         target_w, target_h = self.INPUT_SHAPE
         
         ratio = min(target_w / w, target_h / h)
         new_w = int(w * ratio)
         new_h = int(h * ratio)
         
-        resized = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        resized = cv2.resize(enhanced_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
         
         pad_w = target_w - new_w
         pad_h = target_h - new_h
@@ -571,15 +580,44 @@ class TableRecognizerONNX:
                         if float(np.std(crop_gray)) < 7.0 or int(np.ptp(crop_gray)) < 20:
                             continue
                         cw, ch = crop.shape[1], crop.shape[0]
-                        crop_scaled = cv2.resize(crop, (max(cw * 3, 60), max(ch * 3, 30)), interpolation=cv2.INTER_CUBIC)
-                        rgb_crop = cv2.cvtColor(crop_scaled, cv2.COLOR_BGR2RGB)
-                        txt = pytesseract.image_to_string(rgb_crop, config="--psm 7").strip()
-                        if not txt:
-                            txt = pytesseract.image_to_string(255 - rgb_crop, config="--psm 7").strip()
-                        if txt:
-                            import re
-                            if not re.fullmatch(r"[~—–`'\"|_+=^.\-,;:!?\s]+", txt):
-                                cell_texts[c_idx] = txt
+                        # 1. Check for graphical symbols (e.g., dots/circles) using contour geometry
+                        blur = cv2.GaussianBlur(crop_gray, (3, 3), 0)
+                        _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+                        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        
+                        is_symbol = False
+                        if contours:
+                            c = max(contours, key=cv2.contourArea)
+                            area = cv2.contourArea(c)
+                            if area > 15:  # Ignore tiny noise
+                                x_b, y_b, cw_b, ch_b = cv2.boundingRect(c)
+                                aspect = float(cw_b) / max(1, ch_b)
+                                # Circles and squares have an aspect ratio near 1.0
+                                if 0.7 <= aspect <= 1.4:
+                                    hull = cv2.convexHull(c)
+                                    hull_area = cv2.contourArea(hull)
+                                    # High solidity means it's a filled/solid shape, not a sprawling character
+                                    if hull_area > 0 and (area / hull_area) > 0.75:
+                                        is_symbol = True
+
+                        if is_symbol:
+                            cell_texts[c_idx] = "●"
+                        else:
+                            # 2. Run Tesseract OCR for text
+                            crop_scaled = cv2.resize(crop, (max(cw * 3, 60), max(ch * 3, 30)), interpolation=cv2.INTER_CUBIC)
+                            rgb_crop = cv2.cvtColor(crop_scaled, cv2.COLOR_BGR2RGB)
+                            txt = pytesseract.image_to_string(rgb_crop, config="--psm 7").strip()
+                            if not txt:
+                                txt = pytesseract.image_to_string(255 - rgb_crop, config="--psm 7").strip()
+                            
+                            if txt:
+                                import re
+                                if not re.fullmatch(r"[~—–`'\"|_+=^.\-,;:!?\s]+", txt):
+                                    # Aggressively filter out 1-2 char hallucinated symbol noise
+                                    if len(txt) <= 2 and not any(ch.isalnum() for ch in txt):
+                                        pass
+                                    else:
+                                        cell_texts[c_idx] = txt
 
         # Clean up extraneous OCR artifacts (like stray vertical pipes)
         import re
