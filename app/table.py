@@ -15,16 +15,17 @@ class TableRecognizerONNX:
     rapid-table or rapidocr dependencies.
     """
 
-    # Canonical 50-token vocabulary for PP-Structure SLANet (ch_ppstructure_mobile_v2_SLANet)
+    # Empirically mapped 50-token vocabulary derived directly from SLANet ONNX output tensors
     VOCAB_50 = [
-        "<html>", "<body>", "<table>", "<thead>", "<tbody>", "<tr>", "<td>", "<td", ">",
-        "</td>", "<th>", "<th", "</th>", "</tr>", "</thead>", "</tbody>", "</table>",
-        "</body>", "</html>", 'colspan="2"', 'colspan="3"', 'colspan="4"', 'colspan="5"',
-        'colspan="6"', 'colspan="7"', 'colspan="8"', 'colspan="9"', 'colspan="10"',
-        'colspan="11"', 'colspan="12"', 'colspan="13"', 'colspan="14"', 'colspan="15"',
-        'colspan="16"', 'colspan="17"', 'colspan="18"', 'colspan="19"', 'rowspan="2"',
-        'rowspan="3"', 'rowspan="4"', 'rowspan="5"', 'rowspan="6"', 'rowspan="7"',
-        'rowspan="8"', 'rowspan="9"', 'rowspan="10"', "<td></td>", "<th></th>", "beg", "end"
+        "pad", "<html>", "<table>", "<tbody>", "</tbody>", "<tr>", "</tr>", "<td", ">",
+        "</td>", ' colspan="2"', ' colspan="3"', ' colspan="4"', ' colspan="5"',
+        ' colspan="6"', ' colspan="7"', ' colspan="8"', ' colspan="9"', ' colspan="10"',
+        ' colspan="11"', ' colspan="12"', ' colspan="13"', ' colspan="14"', ' colspan="15"',
+        ' colspan="16"', ' colspan="17"', ' colspan="18"', ' colspan="19"', ' rowspan="2"',
+        ' rowspan="3"', ' rowspan="4"', ' rowspan="5"', ' rowspan="6"', ' rowspan="7"',
+        ' rowspan="8"', ' rowspan="9"', ' rowspan="10"', ' rowspan="11"', ' rowspan="12"',
+        ' rowspan="13"', ' rowspan="14"', ' rowspan="15"', ' rowspan="16"', ' rowspan="17"',
+        ' rowspan="18"', ' rowspan="19"', "<th", "<th></th>", "<td></td>", "end"
     ]
 
     # 41-token vocabulary for English SLANet variant
@@ -382,21 +383,8 @@ class TableRecognizerONNX:
                 logger.warning(f"Could not identify structure_probs from ONNX output shapes: {[o.shape for o in outputs]}")
                 return pred_structures, pred_bboxes
 
-            # --- DIAGNOSTIC LOGGING ---
-            vocab_dim = structure_probs.shape[-1]
-            logger.info("=== SLANet ONNX Diagnostic Output ===")
-            logger.info(f"Output shapes: {[o.shape for o in outputs]}")
-            logger.info(f"Detected vocab_dim: {vocab_dim}")
-            
-            raw_indices = np.argmax(structure_probs, axis=-1).flatten().tolist()
-            logger.info(f"Raw pred_token_indices (first 150): {raw_indices[:150]}")
-            
-            if loc_preds is not None:
-                logger.info(f"Raw loc_preds (first 2): {loc_preds[:2].tolist()}")
-            logger.info("=====================================")
-            # --------------------------
-
             # Select appropriate vocabulary based on output classification dimension
+            vocab_dim = structure_probs.shape[-1]
             if vocab_dim == 50:
                 vocab = self.VOCAB_50
             elif vocab_dim == 41:
