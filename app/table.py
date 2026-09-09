@@ -15,28 +15,30 @@ class TableRecognizerONNX:
     rapid-table or rapidocr dependencies.
     """
 
-    # Standard 37-token vocabulary for RapidTable / PP-Structure SLANet
-    VOCAB_RAPIDTABLE = [
-        "beg", "<html>", "<body>", "<table>", "<thead>", "<tbody>", "<tr>", "<td>", "</td>", "</tr>",
-        "</thead>", "</tbody>", "</table>", "</body>", "</html>", "<td></td>", "<td", ">",
-        ' colspan="2"', ' colspan="3"', ' colspan="4"', ' colspan="5"', ' colspan="6"', ' colspan="7"',
-        ' colspan="8"', ' colspan="9"', ' colspan="10"', ' rowspan="2"', ' rowspan="3"', ' rowspan="4"',
-        ' rowspan="5"', ' rowspan="6"', ' rowspan="7"', ' rowspan="8"', ' rowspan="9"', ' rowspan="10"',
-        "end"
+    # Canonical 50-token vocabulary for PP-Structure SLANet (ch_ppstructure_mobile_v2_SLANet)
+    VOCAB_50 = [
+        "<html>", "<body>", "<table>", "<thead>", "<tbody>", "<tr>", "<td>", "<td", ">",
+        "</td>", "<th>", "<th", "</th>", "</tr>", "</thead>", "</tbody>", "</table>",
+        "</body>", "</html>", 'colspan="2"', 'colspan="3"', 'colspan="4"', 'colspan="5"',
+        'colspan="6"', 'colspan="7"', 'colspan="8"', 'colspan="9"', 'colspan="10"',
+        'colspan="11"', 'colspan="12"', 'colspan="13"', 'colspan="14"', 'colspan="15"',
+        'colspan="16"', 'colspan="17"', 'colspan="18"', 'colspan="19"', 'rowspan="2"',
+        'rowspan="3"', 'rowspan="4"', 'rowspan="5"', 'rowspan="6"', 'rowspan="7"',
+        'rowspan="8"', 'rowspan="9"', 'rowspan="10"', "<td></td>", "<th></th>", "beg", "end"
     ]
 
-    # Extended vocabulary for complex tables
-    VOCAB_EXT = [
-        "beg", "<html>", "<body>", "<table>", "<thead>", "<tbody>", "<tr>", "<td>", "</td>", "</tr>",
-        "</thead>", "</tbody>", "</table>", "</body>", "</html>", "<td></td>", "<td", ">",
-        ' colspan="2"', ' colspan="3"', ' colspan="4"', ' colspan="5"', ' colspan="6"', ' colspan="7"',
-        ' colspan="8"', ' colspan="9"', ' colspan="10"', ' colspan="11"', ' colspan="12"', ' colspan="13"',
-        ' colspan="14"', ' colspan="15"', ' colspan="16"', ' colspan="17"', ' colspan="18"', ' colspan="19"',
-        ' rowspan="2"', ' rowspan="3"', ' rowspan="4"', ' rowspan="5"', ' rowspan="6"', ' rowspan="7"',
-        ' rowspan="8"', ' rowspan="9"', ' rowspan="10"', "<th>", "</th>", "<th></th>", "<th", "end"
+    # 41-token vocabulary for English SLANet variant
+    VOCAB_41 = [
+        "<html>", "<body>", "<table>", "<thead>", "<tbody>", "<tr>", "<td>", "<td", ">",
+        "</td>", "<th>", "<th", "</th>", "</tr>", "</thead>", "</tbody>", "</table>",
+        "</body>", "</html>", 'colspan="2"', 'colspan="3"', 'colspan="4"', 'colspan="5"',
+        'colspan="6"', 'colspan="7"', 'colspan="8"', 'colspan="9"', 'colspan="10"',
+        'rowspan="2"', 'rowspan="3"', 'rowspan="4"', 'rowspan="5"', 'rowspan="6"',
+        'rowspan="7"', 'rowspan="8"', 'rowspan="9"', 'rowspan="10"', "<td></td>",
+        "<th></th>", "beg", "end"
     ]
 
-    VOCAB = VOCAB_RAPIDTABLE
+    VOCAB = VOCAB_50
 
     INPUT_SHAPE = (488, 488)
     MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -382,14 +384,14 @@ class TableRecognizerONNX:
 
             # Select appropriate vocabulary based on output classification dimension
             vocab_dim = structure_probs.shape[-1]
-            if vocab_dim > len(self.VOCAB_RAPIDTABLE) and vocab_dim >= 45:
-                vocab = self.VOCAB_EXT.copy()
+            if vocab_dim == 50:
+                vocab = self.VOCAB_50
+            elif vocab_dim == 41:
+                vocab = self.VOCAB_41
+            elif len(self.VOCAB) == vocab_dim:
+                vocab = self.VOCAB
             else:
-                vocab = self.VOCAB_RAPIDTABLE.copy()
-            
-            # Pad vocabulary to avoid index out of bounds
-            while len(vocab) < vocab_dim:
-                vocab.append("pad")
+                vocab = self.VOCAB_50 if vocab_dim >= 50 else self.VOCAB_41
 
             pred_token_indices = np.argmax(structure_probs, axis=-1)
 
@@ -657,34 +659,34 @@ class TableRecognizerONNX:
                             phrases.append({"bbox": list(t["bbox"]), "text": t["text"]})
                 phrase_rows.append(phrases)
 
-            # Cluster column start boundaries across rows
-            all_starts = sorted([p["bbox"][0] for row in phrase_rows for p in row])
-            col_lefts = []
-            if all_starts:
-                curr_cluster = [all_starts[0]]
-                for x in all_starts[1:]:
-                    if x - (sum(curr_cluster) / len(curr_cluster)) < 60.0:
+            # Cluster column center boundaries across rows to handle center-aligned headers
+            all_centers = sorted([(p["bbox"][0] + p["bbox"][2]) / 2.0 for row in phrase_rows for p in row])
+            col_centers = []
+            if all_centers:
+                curr_cluster = [all_centers[0]]
+                for x in all_centers[1:]:
+                    if x - (sum(curr_cluster) / len(curr_cluster)) < 45.0:
                         curr_cluster.append(x)
                     else:
-                        col_lefts.append(sum(curr_cluster) / len(curr_cluster))
+                        col_centers.append(sum(curr_cluster) / len(curr_cluster))
                         curr_cluster = [x]
                 if curr_cluster:
-                    col_lefts.append(sum(curr_cluster) / len(curr_cluster))
+                    col_centers.append(sum(curr_cluster) / len(curr_cluster))
 
             col_bounds = []
-            for idx, c_left in enumerate(col_lefts):
-                next_left = col_lefts[idx + 1] if idx + 1 < len(col_lefts) else float("inf")
-                col_bounds.append((c_left, next_left))
+            for idx, c_center in enumerate(col_centers):
+                next_center = col_centers[idx + 1] if idx + 1 < len(col_centers) else float("inf")
+                col_bounds.append((c_center, next_center))
 
             table_rows_html = []
             for row in phrase_rows:
                 col_buckets = {i: [] for i in range(len(col_bounds))}
                 for p in row:
-                    px = p["bbox"][0]
+                    px_center = (p["bbox"][0] + p["bbox"][2]) / 2.0
                     best_col = 0
                     min_dist = float("inf")
-                    for c_idx, c_left in enumerate(col_lefts):
-                        dist = abs(px - c_left)
+                    for c_idx, c_center in enumerate(col_centers):
+                        dist = abs(px_center - c_center)
                         if dist < min_dist:
                             min_dist = dist
                             best_col = c_idx
